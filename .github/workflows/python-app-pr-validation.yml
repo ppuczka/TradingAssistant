@@ -27,13 +27,11 @@ jobs:
     - name: Install uv & python tools
       run: |
         curl -LsSf https://astral.sh/uv/install.sh | sh
-        uv sync
         uv tool install ruff
                      
     - name: Install dependencies
       run: |
-        uv venv
-        uv pip install -r requirements.txt
+        uv sync
         
     - name: Lint with flake8
       run: |
