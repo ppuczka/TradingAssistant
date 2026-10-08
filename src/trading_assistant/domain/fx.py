@@ -6,7 +6,7 @@ from pydantic import BaseModel, Field
 
 
 class FxRate(BaseModel):
-    base: Literal["USD"] = "USD"
+    base: Literal["USD", "EUR", "GBP"] = "USD"
     quote: Literal["PLN"] = "PLN"
     rate: Decimal = Field(gt=0, allow_inf_nan=False)
     effective_date: date

@@ -490,3 +490,28 @@ cash events and import scope. IKZE deposits are recognized; optional tickers in
 OPEN/CLOSE BUY comments must match row tickers. Multiple detailed lots per ticker
 remain preserved, summed, and reconciled. Account metadata must still agree across
 all sheets. Investment Plan/Investment Plans remain excluded.
+
+### Implemented: separate European quote refresh
+
+- Twelve Data adapter authenticated with the ignored `TWELVEDATA_API_KEY`.
+- Immediate first request, 60-second per-symbol cache (successes and failures);
+  US Finnhub quotes continue on the five-second dashboard cycle.
+- Central SymbolResolver candidates for Warsaw/XWAR, Xetra/XETR and London/XLON;
+  validate returned ticker and MIC, with no alternative-exchange fallback.
+- Native quote currency in dashboard, colored daily percentage change, AI at right.
+  Preserve report totals and report FX calculations; no invented EUR/GBP conversion.
+- Conservative rolling request budget and 429 cooldown, explicit unavailable/stale
+  alerts. Market coverage and timeliness depend on Twelve Data entitlement.
+- Verified a real PKO/XWAR PLN quote; synthetic tests cover caching, errors,
+  identity/currency validation and European dashboard calculations.
+
+### Implemented: verified Yahoo European fallback
+
+- Tested all 13 current European holdings against Yahoo: matching listing names,
+  exchange identities, native currencies, prices, previous closes and timestamps.
+- YahooMarketDataProvider through explicit yfinance dependency; blocking library
+  calls run off the UI event loop; cache success and failure for 60 seconds.
+- EuropeanQuoteProvider preserves Twelve Data as primary and routes failures to
+  explicitly verified Yahoo mappings. Finnhub US routing remains unchanged.
+- Validate returned identity and currency and reject missing/invalid quote fields.
+  No quote persistence, broker execution or new performance calculation.

@@ -1554,6 +1554,7 @@ dependencies = [
     { name = "textual" },
     { name = "tradingagents" },
     { name = "typer" },
+    { name = "yfinance" },
 ]
 
 [package.dev-dependencies]
@@ -1580,6 +1581,7 @@ requires-dist = [
     { name = "textual", specifier = ">=1,<8" },
     { name = "tradingagents", git = "https://github.com/TauricResearch/TradingAgents.git?rev=1394a3f72aa4393e1a98f51b382434c4b4c2d972" },
     { name = "typer", specifier = ">=0.21,<1" },
+    { name = "yfinance", specifier = ">=1.7,<2" },
 ]
 
 [package.metadata.requires-dev]

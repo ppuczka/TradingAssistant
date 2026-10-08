@@ -125,3 +125,65 @@ uv run ruff check .
 
 TradingAgents is an external dependency pinned to an upstream commit. The
 dashboard does not import or initialize it. See `AGENTS.md` for architectural rules.
+
+Finnhub quote check:
+
+Save `FINNHUB_API_KEY=your-key` in the ignored `.env` in the working directory,
+then run `trader quote GE` (or `trader quote GE.US`). Existing environment values
+ take precedence over `.env`. The command shows the quote timestamp and previous
+close in USD; a retrieved quote is not necessarily a current trading-session quote.
+This initial adapter supports US symbols only. Polish, German and UK holdings
+need verified provider mappings and market access before dashboard valuation.
+Dashboard values remain broker-report snapshots; this command does not change them.
+History and fundamentals are explicit unimplemented operations for now.
+
+The dashboard and P Portfolio screen now refresh automatically every five seconds.
+Finnhub-backed US holdings have separate quote price, quote position value and day
+change percentage columns, colored green for gains and red for losses. Report valuation and P/L
+columns and headline totals remain report snapshots. Unsupported markets and failed
+quotes show an explicit status instead of substituting a price. Day change is (quote price / previous close - 1) × 100%, not actual daily account
+performance. No quotes are persisted and cash remains a confirmed manual snapshot.
+Refreshes do not overlap; requests are paced to at most one per 1.1 seconds, and
+HTTP 429 pauses Finnhub requests for a minute. A large portfolio or slow provider
+can therefore take longer than the five-second refresh interval.
+
+European quote integration uses `TWELVEDATA_API_KEY` from `.env` or the environment.
+US holdings use Finnhub on the five-second dashboard cycle; European quotes and
+failures are cached in memory for 60 seconds, including across the home and Portfolio
+screens. The first request starts immediately. Twelve Data has a conservative local
+budget of eight quote requests per rolling minute and pauses after rate limiting;
+this does not remove provider daily credit limits. More than eight European symbols
+may require additional refresh cycles.
+
+Centralized exchange-qualified mapping covers XTB `.PL` -> XWAR, `.DE` -> XETR,
+and `.UK` -> XLON. Each response must match the requested ticker and MIC; unsupported
+or differently named instruments remain unavailable rather than falling back to
+another exchange. Quote price and quantity-based position value now show the
+provider's currency explicitly, including GBX/GBp (pence), without relabeling as USD.
+Report USD conversion still uses NBP; EUR/GBP quote conversion is not implemented.
+Daily percentage change uses provider previous close. European prices may be delayed
+or end-of-day depending on market entitlement. Timestamps and failures appear in
+alerts; report totals remain separate from quotes.
+
+Yahoo Finance fallback is now enabled for the 13 verified European listings when
+Twelve Data returns an unavailable quote, missing entitlement or request-limit error.
+It also works without a Twelve Data key. Yahoo uses `yfinance` (an unofficial
+personal-use integration), with successful quotes and failures cached for 60 seconds.
+The initial fetch starts immediately and runs in a background thread. Returned
+symbol, exchange, currency, positive prices and quote timestamp are validated;
+missing fields are not filled from report data. Verified symbols are centralized
+in SymbolResolver: `.DE` listings, the three London `.L` listings and the three
+Warsaw `.WA` listings. New holdings need explicit verification before Yahoo fallback.
+No Yahoo API key is required. Yahoo cookies/timezone cache stays under
+`data/yahoo-cache`, separate from the portfolio database. Quotes may be delayed;
+USD London listings keep their actual USD currency.
+
+Portfolio tables include the full instrument name next to the ticker. The imported
+name appears immediately; a provider's full listing name replaces it when available.
+Today's P/L now shows a colored PLN estimate: sum of current quantity multiplied by
+(quote price minus previous close), converted using NBP USD/EUR/GBP reference rates.
+GBP pence quotes are divided by 100 before conversion. It requires every holding to
+have a quote dated today (UTC) and a usable currency rate; otherwise the total remains
+unavailable with a coverage explanation. This estimate excludes intraday trades,
+realized gains, fees and daily FX movement. Cached FX publication dates and stale
+status remain explicit in alerts; it is not audited daily account performance.

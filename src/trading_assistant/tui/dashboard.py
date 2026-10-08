@@ -1,5 +1,6 @@
 """Presentation only: render the snapshot supplied by an application service."""
 
+import asyncio
 from decimal import Decimal
 
 from rich.text import Text
@@ -25,7 +26,18 @@ def percent(value: Decimal | None) -> Text:
     return Text(f"{value:+.2f}%", style="green" if value >= 0 else "red")
 
 
-PORTFOLIO_COLUMNS = ("SYMBOL", "QUANTITY", "VALUE", "VALUE USD", "P/L", "AI")
+PORTFOLIO_COLUMNS = (
+    "SYMBOL",
+    "NAME",
+    "QUANTITY",
+    "REPORT VALUE",
+    "REPORT USD",
+    "REPORT P/L",
+    "QUOTE PRICE",
+    "QUOTE VALUE",
+    "DAY CHANGE %",
+    "AI",
+)
 
 
 def populate_portfolio(table: DataTable, snapshot: DashboardSnapshot) -> None:
@@ -33,10 +45,14 @@ def populate_portfolio(table: DataTable, snapshot: DashboardSnapshot) -> None:
     for position in snapshot.positions:
         table.add_row(
             Text(position.symbol),
+            Text(position.name),
             str(position.quantity) if position.quantity is not None else "—",
             money(position.market_value, position.currency),
             money(position.market_value_usd, "USD"),
             percent(position.pnl_percent),
+            money(position.quote_price, position.quote_currency),
+            money(position.quote_value, position.quote_currency),
+            percent(position.quote_daily_change_percent),
             Text(position.recommendation or "—"),
         )
 
@@ -52,11 +68,13 @@ class PortfolioScreen(Screen):
     def __init__(self, service: DashboardService) -> None:
         super().__init__()
         self.service = service
+        self.refresh_lock = asyncio.Lock()
+        self.initial_load = True
 
     def compose(self) -> ComposeResult:
         yield Header()
         with Vertical(id="portfolio-view-body"):
-            yield Static("PORTFOLIO • My Trades", classes="heading")
+            yield Static("PORTFOLIO • My Trades / IKZE", classes="heading")
             yield Static("Loading holdings…", id="portfolio-view-notice", markup=False)
             yield Static("", id="portfolio-view-fx", classes="message", markup=False)
             yield DataTable(id="portfolio-view-table", cursor_type="row")
@@ -69,10 +87,23 @@ class PortfolioScreen(Screen):
         self.query_one(DataTable).focus()
         self.action_refresh()
 
-    @work(exclusive=True)
+    @work()
     async def action_refresh(self) -> None:
+        if self.refresh_lock.locked():
+            return
+        async with self.refresh_lock:
+            await self.refresh_snapshot()
+
+    async def refresh_snapshot(self) -> None:
         notice = self.query_one("#portfolio-view-notice", Static)
         try:
+            initial_snapshot = getattr(self.service, "initial_snapshot", None)
+            if self.initial_load and initial_snapshot is not None:
+                self.initial_load = False
+                initial = await initial_snapshot()
+                populate_portfolio(self.query_one(DataTable), initial)
+                notice.update("Read-only portfolio • Loading market data…")
+                self.query_one("#portfolio-view-fx", Static).update(initial.market_status or "")
             snapshot = await self.service.snapshot()
         except Exception:
             notice.update("Unable to refresh holdings. Displayed values may be stale. F5 retries.")
@@ -86,7 +117,9 @@ class PortfolioScreen(Screen):
             else "No open positions available. Import a report with trader import-xtb."
         )
         self.query_one("#portfolio-view-status", Static).update("\n".join(snapshot.alerts))
-        self.query_one("#portfolio-view-fx", Static).update(snapshot.fx_status or "")
+        self.query_one("#portfolio-view-fx", Static).update(
+            "\n".join(filter(None, (snapshot.fx_status, snapshot.market_status)))
+        )
 
     def action_back(self) -> None:
         self.app.pop_screen()
@@ -134,6 +167,8 @@ class DashboardApp(App[None]):
     def __init__(self, service: DashboardService) -> None:
         super().__init__()
         self.service = service
+        self.refresh_lock = asyncio.Lock()
+        self.initial_load = True
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -171,13 +206,30 @@ class DashboardApp(App[None]):
         )
         self.set_class(self.size.width < 100, "compact")
         self.action_refresh()
+        self.set_interval(5, self.refresh_active_screen)
+
+    def refresh_active_screen(self) -> None:
+        if isinstance(self.screen, PortfolioScreen):
+            self.screen.action_refresh()
+        else:
+            self.action_refresh()
 
     def on_resize(self) -> None:
         self.set_class(self.size.width < 100, "compact")
 
-    @work(exclusive=True)
+    @work()
     async def action_refresh(self) -> None:
+        if self.refresh_lock.locked():
+            return
+        async with self.refresh_lock:
+            await self.refresh_snapshot()
+
+    async def refresh_snapshot(self) -> None:
         try:
+            initial_snapshot = getattr(self.service, "initial_snapshot", None)
+            if self.initial_load and initial_snapshot is not None:
+                self.initial_load = False
+                self.render_snapshot(await initial_snapshot())
             snapshot = await self.service.snapshot()
         except Exception:
             self.home_screen.query_one("#intro", Static).update(
@@ -214,18 +266,25 @@ class DashboardApp(App[None]):
             )
             if widget_id == "cash" and value is not None:
                 content += "\nConfirmed snapshot"
+            if widget_id == "today" and value is not None:
+                content += "\nEstimated • reference FX"
             if usd is not None:
                 content += f"\n{money(usd, 'USD')}"
             if value is None and snapshot.positions:
                 reason = {
                     "cash": "Confirmed balance needed",
-                    "today": "Live quotes needed",
+                    "today": "Quotes / FX incomplete",
                     "total": "Report P/L unavailable",
                     "value": "Valuation unavailable",
                 }[widget_id]
                 content += f"\n{reason}"
-            widget.update(Text(content, style="bold"))
-        self.home_screen.query_one("#fx-status", Static).update(snapshot.fx_status or "")
+            style = "bold"
+            if widget_id == "today" and value is not None:
+                style += " green" if value >= 0 else " red"
+            widget.update(Text(content, style=style))
+        self.home_screen.query_one("#fx-status", Static).update(
+            "\n".join(filter(None, (snapshot.fx_status, snapshot.market_status)))
+        )
 
         populate_portfolio(self.home_screen.query_one("#portfolio-table", DataTable), snapshot)
         self.home_screen.query_one("#portfolio-empty", Static).update(

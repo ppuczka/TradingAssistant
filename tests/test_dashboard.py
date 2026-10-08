@@ -31,9 +31,11 @@ class FakeService:
             unrealized_pnl_usd=Decimal("-7.50"),
             fx_status="NBP reference FX: 1 USD = 4 PLN",
             cash=Decimal("250"),
+            today_pnl=Decimal("-12.50"),
             positions=[
                 PortfolioRow(
                     symbol="GE",
+                    name="GE Aerospace",
                     market_value=Decimal("1000"),
                     market_value_usd=Decimal("250"),
                     currency="PLN",
@@ -79,9 +81,12 @@ async def test_snapshot_render_refresh_and_failure_keep_previous_data() -> None:
         table = app.query_one("#portfolio-table", DataTable)
         assert table.row_count == 1
         assert str(table.get_row_at(0)[0]) == "GE"
-        assert table.get_row_at(0)[3] == "250.00 USD"
+        assert str(table.get_row_at(0)[1]) == "GE Aerospace"
+        assert table.get_row_at(0)[4] == "250.00 USD"
         assert "1,000.00 PLN" in str(app.query_one("#metric-value", Static).render())
         assert "250.00 USD" in str(app.query_one("#metric-value", Static).render())
+        assert "-12.50 PLN" in str(app.query_one("#metric-today", Static).render())
+        assert "Estimated" in str(app.query_one("#metric-today", Static).render())
         assert "-7.50 USD" in str(app.query_one("#metric-total", Static).render())
         assert "NBP reference" in str(app.query_one("#fx-status", Static).render())
         assert "80.0%" in str(app.query_one("#allocation", Static).render())
@@ -112,6 +117,7 @@ async def test_p_opens_populated_portfolio_and_refreshes(size: tuple[int, int]) 
         table = screen.query_one("#portfolio-view-table", DataTable)
         assert table.row_count == 1
         assert str(table.get_row_at(0)[0]) == "GE"
+        assert str(table.get_row_at(0)[1]) == "GE Aerospace"
         await pilot.press("p")
         assert app.screen is screen
         calls = service.calls
@@ -127,3 +133,51 @@ async def test_p_opens_populated_portfolio_and_refreshes(size: tuple[int, int]) 
         assert app.screen is app.home_screen
         await pilot.press("q")
         assert not app.is_running
+
+
+async def test_periodic_refresh_routes_to_active_screen():
+    service = FakeService()
+    app = DashboardApp(service)
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        calls = service.calls
+        app.refresh_active_screen()
+        await app.workers.wait_for_complete()
+        assert service.calls == calls + 1
+        await pilot.press("p")
+        await app.workers.wait_for_complete()
+        calls = service.calls
+        app.refresh_active_screen()
+        await app.workers.wait_for_complete()
+        assert service.calls == calls + 1
+        assert app.screen.query_one(DataTable).row_count == 1
+
+
+@pytest.mark.parametrize(
+    "change,expected,color",
+    [
+        ("2.5", "+2.50%", "green"),
+        ("-1.25", "-1.25%", "red"),
+    ],
+)
+async def test_daily_percentage_color_and_no_status_column(change, expected, color):
+    service = FakeService()
+    original_snapshot = service.snapshot
+
+    async def snapshot():
+        result = await original_snapshot()
+        result.positions[0].quote_daily_change_percent = Decimal(change)
+        return result
+
+    service.snapshot = snapshot
+    app = DashboardApp(service)
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        table = app.query_one("#portfolio-table", DataTable)
+        cell = table.get_row_at(0)[8]
+        assert str(cell) == expected
+        assert cell.style == color
+        assert len(table.columns) == 10
+        await pilot.press("p")
+        await app.workers.wait_for_complete()
+        assert str(app.screen.query_one(DataTable).get_row_at(0)[8]) == expected

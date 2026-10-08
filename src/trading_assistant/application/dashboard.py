@@ -8,12 +8,21 @@ from pydantic import BaseModel, Field
 
 class PortfolioRow(BaseModel):
     symbol: str
+    name: str = ""
     quantity: Decimal | None = None
     market_value: Decimal | None = None
     market_value_usd: Decimal | None = None
     currency: str
     pnl_percent: Decimal | None = None
     recommendation: str | None = None
+    quote_price_usd: Decimal | None = None
+    quote_value_usd: Decimal | None = None
+    quote_price: Decimal | None = None
+    quote_value: Decimal | None = None
+    quote_currency: str | None = None
+    quote_daily_change_percent: Decimal | None = None
+    quote_daily_change: Decimal | None = None
+    quote_status: str = "Report only"
 
 
 class AllocationRow(BaseModel):
@@ -33,6 +42,7 @@ class DashboardSnapshot(BaseModel):
     cash: Decimal | None = None
     cash_as_of: str | None = None
     today_pnl: Decimal | None = None
+    today_pnl_status: str | None = None
     total_pnl: Decimal | None = None
     valuation_as_of: str | None = None
     holdings_value: Decimal | None = None
@@ -40,6 +50,7 @@ class DashboardSnapshot(BaseModel):
     unrealized_pnl: Decimal | None = None
     unrealized_pnl_usd: Decimal | None = None
     fx_status: str | None = None
+    market_status: str | None = None
     positions: list[PortfolioRow] = Field(default_factory=list)
     allocation: list[AllocationRow] = Field(default_factory=list)
     opportunities: list[OpportunityRow] = Field(default_factory=list)

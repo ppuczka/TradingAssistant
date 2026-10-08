@@ -150,3 +150,72 @@ async def test_fx_failure_does_not_hide_pln_holdings():
     assert snapshot.holdings_value_usd is None
     assert snapshot.positions[0].market_value_usd is None
     assert "unavailable" in snapshot.fx_status
+
+
+async def test_nbp_eur_gbp_cache_and_identity(tmp_path):
+    calls = []
+
+    def handler(request):
+        currency = request.url.path.split("/")[-2].upper()
+        calls.append(currency)
+        return httpx.Response(200, json=response(code=currency))
+
+    provider = NbpFxRateProvider(
+        tmp_path / "nbp-usd-pln.json", transport=httpx.MockTransport(handler)
+    )
+    for currency in ("EUR", "GBP"):
+        actual = await provider.currency_pln(currency)
+        assert actual.base == currency
+        assert actual.rate == Decimal(4)
+        assert (await provider.currency_pln(currency)).base == currency
+    assert calls == ["EUR", "GBP"]
+
+
+@pytest.mark.parametrize("missing,old_quote", [(False, False), (True, False), (False, True)])
+async def test_daily_summary_multi_currency_and_missing_coverage(missing, old_quote):
+    from trading_assistant.domain.market import MarketDataError, Quote
+
+    holdings = [
+        Holding(symbol=s, name="Full instrument name", asset_type="ETF", quantity="2")
+        for s in ("AAA.US", "BBB.DE", "CCC.UK", "DDD.PL")
+    ]
+
+    class Repository:
+        def portfolio(self):
+            return PortfolioState(holdings=holdings, report_dates=[datetime.now(UTC)])
+
+    class Provider:
+        async def quote(self, symbol):
+            if missing and symbol.startswith("BBB"):
+                raise MarketDataError("unavailable")
+            currency = {"AAA": "USD", "BBB": "EUR", "CCC": "GBp", "DDD": "PLN"}[symbol[:3]]
+            as_of = datetime.now(UTC) - timedelta(days=1 if old_quote else 0)
+            return Quote(
+                symbol=symbol,
+                name="Provider full name",
+                currency=currency,
+                price="110",
+                previous_close="100",
+                as_of=as_of,
+                retrieved_at=datetime.now(UTC),
+                source="Test",
+            )
+
+    class Fx:
+        async def usd_pln(self):
+            return rate()
+
+        async def currency_pln(self, currency):
+            return rate(base=currency, rate=Decimal("5") if currency == "EUR" else Decimal("6"))
+
+    snapshot = await PortfolioDashboardService(
+        Repository(), Fx(), Provider(), Provider()
+    ).snapshot()
+    assert snapshot.positions[0].name == "Provider full name"
+    if missing or old_quote:
+        assert snapshot.today_pnl is None
+        assert "unavailable" in snapshot.today_pnl_status
+    else:
+        # 20 USD * 4 + 20 EUR * 5 + 20 pence / 100 * 6 + 20 PLN
+        assert snapshot.today_pnl == Decimal("201.2")
+        assert "excludes trades" in snapshot.today_pnl_status

@@ -1,11 +1,13 @@
 """CLI entry point. With no command, open the terminal dashboard."""
 
 import asyncio
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated
 
 import typer
+from dotenv import load_dotenv
 from pydantic import ValidationError
 from rich.console import Console
 from rich.table import Table
@@ -18,6 +20,30 @@ from trading_assistant.domain.portfolio import CashBalanceInput, ImportValidatio
 
 app = typer.Typer(no_args_is_help=False, help="Personal AI portfolio and trading assistant.")
 DEFAULT_DATABASE_PATH = Path("data/portfolio.sqlite3")
+
+
+@app.command()
+def quote(symbol: str) -> None:
+    """Fetch a Finnhub US quote (canonical ticker or XTB .US symbol)."""
+    from trading_assistant.adapters.finnhub import FinnhubMarketDataProvider
+    from trading_assistant.application.market import SymbolResolver
+    from trading_assistant.domain.market import MarketDataError
+
+    load_dotenv(Path(".env"), override=False)
+    try:
+        resolved = SymbolResolver().finnhub_us(symbol)
+        provider = FinnhubMarketDataProvider(os.environ.get("FINNHUB_API_KEY", ""))
+        result = asyncio.run(provider.quote(resolved))
+    except MarketDataError as exc:
+        Console().print(Text(str(exc)))
+        raise typer.Exit(1) from None
+    Console().print(
+        Text(
+            f"{result.symbol}: {result.price} {result.currency} • "
+            f"Previous close: {result.previous_close} • Quote as of {result.as_of.isoformat()} "
+            f"• Retrieved {result.retrieved_at.isoformat()} • {result.source}"
+        )
+    )
 
 
 @app.callback(invoke_without_command=True)
@@ -47,11 +73,12 @@ def portfolio(ctx: typer.Context) -> None:
             console.print(Text(alert))
         return
     table = Table(title="Portfolio")
-    for name in ("Symbol", "Quantity", "Value", "Currency", "Value USD", "P/L %", "AI"):
+    for name in ("Symbol", "Name", "Quantity", "Value", "Currency", "Value USD", "P/L %", "AI"):
         table.add_column(name)
     for row in snapshot.positions:
         table.add_row(
             Text(row.symbol),
+            Text(row.name),
             str(row.quantity) if row.quantity is not None else "—",
             str(row.market_value) if row.market_value is not None else "—",
             Text(row.currency),
@@ -66,6 +93,8 @@ def portfolio(ctx: typer.Context) -> None:
         console.print(f"Holdings value USD: {snapshot.holdings_value_usd:,.2f} USD")
     if snapshot.unrealized_pnl is not None:
         console.print(f"Unrealized P/L: {snapshot.unrealized_pnl:,.2f} PLN")
+    if snapshot.today_pnl is not None:
+        console.print(f"Today's P/L (estimated): {snapshot.today_pnl:,.2f} PLN")
     for alert in snapshot.alerts:
         console.print(Text(alert))
 
