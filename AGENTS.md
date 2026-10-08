@@ -41,7 +41,8 @@ Ask the owner before making an architectural change that contradicts these rules
 - Store recommendation history and periodic portfolio snapshots in their milestones.
   Keep future performance/benchmark evaluation possible without implementing it early.
 - CLI and Textual dashboard call application services; neither contains business logic.
-- Current XTB import scope is My Trades only. Exclude Investment Plan/Investment
+- Current XTB import scope includes My Trades and IKZE. Missing report currency
+  defaults to PLN by explicit owner policy; reject conflicting or non-PLN evidence. Exclude Investment Plan/Investment
   Plans rows from the ledger, valuations, dashboard, and AI context. ETFs held
   in My Trades remain in scope. Keep My Trades-side transfers to/from excluded
   plans as cash movements, not investment profit. Do not import the excluded leg.

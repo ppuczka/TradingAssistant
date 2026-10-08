@@ -1,8 +1,8 @@
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import AwareDatetime, BaseModel, Field, field_validator
 
 
 class InstrumentData(BaseModel):
@@ -12,6 +12,7 @@ class InstrumentData(BaseModel):
 
 
 class CashEvent(BaseModel):
+    product: Literal["MY_TRADES", "IKZE"] = "MY_TRADES"
     operation_id: str
     kind: str
     occurred_at: datetime
@@ -35,6 +36,7 @@ class ReportPosition(BaseModel):
 
 
 class BrokerReport(BaseModel):
+    scope: Literal["MY_TRADES", "IKZE", "MY_TRADES_IKZE"] = "MY_TRADES"
     account_number: str
     currency: Literal["PLN"]
     fingerprint: str
@@ -64,14 +66,32 @@ class Holding(BaseModel):
     quantity: Decimal
     report_value: Decimal | None = None
     report_pnl_percent: Decimal | None = None
+    report_pnl_amount: Decimal | None = None
 
 
 class PortfolioState(BaseModel):
     holdings: list[Holding] = Field(default_factory=list)
     report_dates: list[datetime] = Field(default_factory=list)
     cash_movement: Decimal = Decimal("0")
+    cash_balance: Decimal | None = None
+    cash_balance_dates: list[datetime] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
 
 
 class ImportValidationError(ValueError):
     """Invalid report, conflict, or failed ledger reconciliation."""
+
+
+class CashBalanceInput(BaseModel):
+    """A human-confirmed My Trades cash observation, not a ledger event."""
+
+    amount: Decimal = Field(ge=0, allow_inf_nan=False)
+    as_of: AwareDatetime
+
+    @field_validator("as_of")
+    @classmethod
+    def validate_time(cls, value: datetime) -> datetime:
+        value = value.astimezone(UTC)
+        if value > datetime.now(UTC):
+            raise ValueError("Cash balance timestamp cannot be in the future.")
+        return value

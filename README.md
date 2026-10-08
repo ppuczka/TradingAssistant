@@ -18,9 +18,16 @@ uv run trader --help
 The dashboard shows portfolio totals, positions, allocation, AI status,
 opportunities, and alerts. Missing data is shown as unavailable, never as a
 fabricated balance or recommendation. No API key is needed to open the dashboard.
-Positions include a separate Value USD column. Currency conversion is planned
-through an application service using NBP reference rates; until connected, USD
-values remain unavailable. The original value and its currency are preserved.
+Positions include a separate Value USD column, populated through the public NBP
+table A API. Holdings value and unrealized P/L cards show PLN and USD. The original
+report values are preserved; USD amounts use the latest published reference rate,
+not a live FX quote or historical performance rate. The source and publication date
+appear in both views. No API key is required.
+
+Rates are cached for one hour in memory and beside the database as
+`nbp-usd-pln.json`. Requests time out after five seconds. On API failure, an older
+cached rate is explicitly marked stale; without a usable rate, USD values remain
+unavailable while PLN values remain visible.
 
 Press **P** to open Portfolio, **Esc** to return to the dashboard, **F5** to
 refresh the current view, and **Q** to quit. Scroll to
@@ -39,14 +46,16 @@ uv run trader portfolio
 uv run trader
 ```
 
-Import scope is **My Trades only**. Investment Plan/Investment Plans records are
+Import scope is **My Trades and IKZE**. Investment Plan/Investment Plans records are
 excluded, while ETFs under My Trades remain included. Transfers on the My Trades
 side remain cash movements. When account-number cells are blank, `--account` is
 required; a conflicting account selection is rejected.
-Only verified PLN-denominated reports are currently supported. Currency must be
-identified by explicit account/base-currency metadata or the My Trades valuation
-summary. Missing, conflicting, or non-PLN currency evidence is rejected; explicit
-cash-row currencies must agree. Foreign instrument execution prices are not
+Only PLN-denominated reports are currently supported. Explicit account/base
+metadata and included-product valuation summaries must agree on PLN. Missing or
+blank currency defaults to PLN by owner policy; conflicting and non-PLN evidence
+is rejected. Explicit cash-row currencies must agree. Trade comments may include
+a ticker, which must match the row ticker. Multiple detailed lots per ticker are
+preserved and reconciled beneath the instrument summary. Foreign instrument execution prices are not
 relabeled PLN.
 
 `--dry-run` parses and previews without opening the database. The actual import
@@ -60,9 +69,35 @@ preserving the previously displayed quantities and report valuations.
 Closed-position and open-lot rows are preserved as evidence, not additional trades.
 
 The dashboard shows report-dated PLN position values and unrealized P/L percentages,
-not live quotes. Cash balance, daily performance, full portfolio total, and USD
-conversions remain unavailable until their required inputs are established.
+not live quotes. The summary shows holdings value and reported unrealized P/L,
+rather than claiming a complete portfolio value or total investment return. Cash
+balance is available after manual confirmation. Daily performance and full portfolio
+total remain unavailable until their required inputs are established.
 Imported net cash movements are shown separately from verified cash balance.
+
+### Confirm cash balance
+
+Provide the **My Trades cash balance in PLN**, excluding investment plans. You can
+save it atomically with an import or set it later for an already imported account:
+
+```sh
+uv run trader import-xtb broker_reports/report.xlsx --account YOUR_ACCOUNT_ID --cash-balance 250.12
+uv run trader set-cash 250.12 --account YOUR_ACCOUNT_ID
+```
+
+The timestamp defaults to the current time. For an earlier observation, use
+`--cash-as-of "2026-10-08T16:00:00+02:00"` during import or
+`--as-of "2026-10-08T16:00:00+02:00"` with `set-cash`.
+Amounts must be finite and nonnegative; timestamps require a timezone and cannot
+be in the future. Import `--dry-run` previews the balance without writing anything.
+
+Cash confirmations are retained as dated observations, separate from transactions.
+The latest observation per account is displayed, with its timestamp in alerts and
+CLI output. Imports do not automatically change that balance: complete cash history
+is not yet established. Refresh the confirmation after activity. With multiple
+accounts, the cash total is shown only when all accounts have confirmations.
+Holdings values and cash may have different timestamps, so a full portfolio total
+is still unavailable.
 
 The database defaults to ignored `data/portfolio.sqlite3`; reports belong in
 ignored `broker_reports/`. Select another database with a global option or env var:

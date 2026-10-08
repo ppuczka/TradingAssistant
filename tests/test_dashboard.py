@@ -23,15 +23,20 @@ class FakeService:
         if self.fail:
             raise RuntimeError("private provider detail")
         return DashboardSnapshot(
-            currency="USD",
+            currency="PLN",
             portfolio_value=Decimal("1250"),
+            holdings_value=Decimal("1000"),
+            holdings_value_usd=Decimal("250"),
+            unrealized_pnl=Decimal("-30"),
+            unrealized_pnl_usd=Decimal("-7.50"),
+            fx_status="NBP reference FX: 1 USD = 4 PLN",
             cash=Decimal("250"),
             positions=[
                 PortfolioRow(
                     symbol="GE",
                     market_value=Decimal("1000"),
-                    market_value_usd=Decimal("1000"),
-                    currency="USD",
+                    market_value_usd=Decimal("250"),
+                    currency="PLN",
                     pnl_percent=Decimal("-3.3"),
                     recommendation="HOLD",
                 )
@@ -74,8 +79,11 @@ async def test_snapshot_render_refresh_and_failure_keep_previous_data() -> None:
         table = app.query_one("#portfolio-table", DataTable)
         assert table.row_count == 1
         assert str(table.get_row_at(0)[0]) == "GE"
-        assert table.get_row_at(0)[3] == "1,000.00 USD"
-        assert "1,250.00 USD" in str(app.query_one("#metric-value", Static).render())
+        assert table.get_row_at(0)[3] == "250.00 USD"
+        assert "1,000.00 PLN" in str(app.query_one("#metric-value", Static).render())
+        assert "250.00 USD" in str(app.query_one("#metric-value", Static).render())
+        assert "-7.50 USD" in str(app.query_one("#metric-total", Static).render())
+        assert "NBP reference" in str(app.query_one("#fx-status", Static).render())
         assert "80.0%" in str(app.query_one("#allocation", Static).render())
         assert app.query_one("#opportunities-table", DataTable).get_row_at(0)[2] == "—"
         await pilot.press("f5")

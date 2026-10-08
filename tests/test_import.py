@@ -357,7 +357,7 @@ def test_cli_preview_does_not_create_database(report_path, tmp_path):
     assert not path.exists()
 
 
-@pytest.mark.parametrize("currency", ["EUR", "USD", None])
+@pytest.mark.parametrize("currency", ["EUR", "USD"])
 def test_unverified_currency_is_rejected_before_persistence(repository, report_path, currency):
     from openpyxl import load_workbook
 
@@ -372,14 +372,13 @@ def test_unverified_currency_is_rejected_before_persistence(repository, report_p
     assert count(repository, CashOperation) == 0
 
 
-def test_absent_currency_evidence_is_rejected(report_path):
+def test_absent_currency_defaults_to_pln(report_path):
     from openpyxl import load_workbook
 
     workbook = load_workbook(report_path)
     workbook["Open Positions"].delete_rows(3, 3)
     workbook.save(report_path)
-    with pytest.raises(ImportValidationError, match="currency cannot be established"):
-        XtbReportReader().read(report_path)
+    assert XtbReportReader().read(report_path).currency == "PLN"
 
 
 def test_currency_metadata_must_agree_with_summary(report_path):
@@ -499,3 +498,153 @@ def test_new_report_checks_affected_snapshots_before_its_own_date(repository, re
         repository.import_report(report)
     assert count(repository, ImportBatch) == 1
     assert count(repository, Transaction) == 4
+
+
+async def test_cash_confirmation_import_update_and_dashboard(repository, report_path):
+    from trading_assistant.domain.portfolio import CashBalanceInput
+
+    report = XtbReportReader().read(report_path)
+    first = CashBalanceInput(amount="123.456789", as_of="2026-10-01T14:00:00+02:00")
+    repository.import_report(report, first)
+    state = repository.portfolio()
+    assert state.cash_balance == Decimal("123.456789")
+    assert state.cash_balance_dates == [datetime(2026, 10, 1, 12, tzinfo=UTC)]
+    snapshot = await PortfolioDashboardService(repository).snapshot()
+    assert snapshot.cash == Decimal("123.456789")
+    assert any("manual snapshot" in alert for alert in snapshot.alerts)
+    assert snapshot.portfolio_value is None
+    second = CashBalanceInput(amount="0", as_of="2026-10-02T12:00:00Z")
+    repository.set_cash_balance(report.account_number, second)
+    repository.set_cash_balance(report.account_number, first)
+    assert repository.portfolio().cash_balance == 0
+    # Reimporting does not erase or automatically adjust a confirmation.
+    repository.import_report(report)
+    assert repository.portfolio().cash_balance == 0
+
+
+def test_cash_confirmation_atomic_rollback_and_unknown_account(repository, report_path):
+    from trading_assistant.adapters.database import CashBalance
+    from trading_assistant.domain.portfolio import CashBalanceInput
+
+    balance = CashBalanceInput(amount="100", as_of="2026-10-01T12:00:00Z")
+    with pytest.raises(ImportValidationError, match="Unknown account"):
+        repository.set_cash_balance("missing", balance)
+    report = XtbReportReader().read(report_path)
+    report.cash_events = [event for event in report.cash_events if event.operation_id != "b2"]
+    with pytest.raises(ImportValidationError):
+        repository.import_report(report, balance)
+    assert count(repository, CashBalance) == 0
+    assert count(repository, Account) == 0
+
+
+def test_cash_total_requires_every_account(repository, report_path):
+    from trading_assistant.domain.portfolio import CashBalanceInput
+
+    report = XtbReportReader().read(report_path)
+    balance = CashBalanceInput(amount="100", as_of="2026-10-01T12:00:00Z")
+    repository.import_report(report, balance)
+    repository.import_report(report.model_copy(update={"account_number": "second"}))
+    assert repository.portfolio().cash_balance is None
+    repository.set_cash_balance("second", balance)
+    assert repository.portfolio().cash_balance == 200
+
+
+def test_cash_cli_import_dry_run_and_later_update(report_path, tmp_path):
+    from typer.testing import CliRunner
+
+    from trading_assistant.bootstrap import repository as open_repository
+    from trading_assistant.cli import app
+
+    database = tmp_path / "cli-cash.sqlite3"
+    runner = CliRunner()
+    base = ["--database", str(database)]
+    args = [
+        "import-xtb",
+        str(report_path),
+        "--cash-balance",
+        "321.09",
+        "--cash-as-of",
+        "2026-10-01T12:00:00Z",
+    ]
+    preview = runner.invoke(app, base + args + ["--dry-run"])
+    assert preview.exit_code == 0, preview.output
+    assert "Cash preview" in preview.output
+    assert not database.exists()
+    imported = runner.invoke(app, base + args)
+    assert imported.exit_code == 0, imported.output
+    assert open_repository(database).portfolio().cash_balance == Decimal("321.09")
+    updated = runner.invoke(
+        app,
+        base
+        + [
+            "set-cash",
+            "250.12",
+            "--account",
+            "synthetic-account",
+            "--as-of",
+            "2026-10-02T12:00:00Z",
+        ],
+    )
+    assert updated.exit_code == 0, updated.output
+    assert open_repository(database).portfolio().cash_balance == Decimal("250.12")
+
+
+@pytest.mark.parametrize("currency", [None, "PLN"])
+def test_ikze_import_new_trade_comments_and_multiple_lots(repository, report_path, currency):
+    from openpyxl import load_workbook
+
+    workbook = load_workbook(report_path)
+    for sheet in workbook:
+        for row in sheet:
+            for cell in row:
+                if cell.value == "My Trades":
+                    cell.value = "IKZE"
+    workbook["Open Positions"]["D4"] = currency
+    opened = workbook["Open Positions"]
+    opened["F8"] = 0.75
+    opened["G8"] = 75
+    opened.insert_rows(9)
+    for col, value in enumerate(["IKZE", "103", "TEST.US", None, "BUY", 0.5, 50, 0], 1):
+        opened.cell(9, col, value)
+    cash = workbook["Cash Operations"]
+    cash["J8"] = "103"
+    for row in cash.iter_rows(min_row=6):
+        if row[0].value == "Deposit":
+            row[0].value = "IKZE deposit"
+        if row[0].value in {"Stock purchase", "Stock sell"} and row[8].value == "IKZE":
+            comment = row[7].value
+            row[7].value = comment.replace(" BUY ", f" BUY {row[2].value} ", 1)
+    workbook.save(report_path)
+    report = XtbReportReader().read(report_path)
+    assert report.scope == "IKZE"
+    assert report.currency == "PLN"
+    assert all(event.product == "IKZE" for event in report.cash_events)
+    stock = next(position for position in report.positions if position.symbol == "TEST.US")
+    assert len(stock.lots) == 2
+    repository.import_report(report)
+    assert count(repository, Transaction) == 4
+    with Session(repository.engine) as session:
+        assert set(session.scalars(select(CashOperation.product))) == {"IKZE"}
+        assert session.scalar(select(ImportBatch.scope)) == "IKZE"
+    state = repository.portfolio()
+    assert next(h for h in state.holdings if h.symbol == "TEST.US").quantity == Decimal("1.25")
+    assert repository.import_report(report).already_imported
+
+
+def test_trade_comment_ticker_must_match_row(report_path):
+    from openpyxl import load_workbook
+
+    workbook = load_workbook(report_path)
+    workbook["Cash Operations"]["H7"] = "OPEN BUY WRONG.US 1/1.5 @ 100"
+    workbook.save(report_path)
+    with pytest.raises(ImportValidationError, match="ticker disagrees"):
+        XtbReportReader().read(report_path)
+
+
+def test_blank_summary_currency_defaults_to_pln(report_path):
+    from openpyxl import load_workbook
+
+    workbook = load_workbook(report_path)
+    workbook["Open Positions"]["D4"] = None
+    workbook.save(report_path)
+    assert XtbReportReader().read(report_path).currency == "PLN"

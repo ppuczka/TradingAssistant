@@ -20,7 +20,9 @@ from trading_assistant.domain.portfolio import (
 )
 
 TRADE_COMMENT = re.compile(
-    r"^(OPEN|CLOSE) BUY (\d+(?:\.\d+)?)(?:/(\d+(?:\.\d+)?))? @ (\d+(?:\.\d+)?)$"
+    r"^(?P<direction>OPEN|CLOSE) BUY (?:(?P<ticker>[A-Z][A-Z0-9.]*\.[A-Z]+) )?"
+    r"(?P<quantity>\d+(?:\.\d+)?)(?:/(?P<total>\d+(?:\.\d+)?))? "
+    r"@ (?P<price>\d+(?:\.\d+)?)$"
 )
 TOLERANCE = Decimal("0.00000001")
 KNOWN_CASH_TYPES = {
@@ -28,6 +30,7 @@ KNOWN_CASH_TYPES = {
     "Stock sell",
     "Subaccount transfer",
     "Deposit",
+    "IKZE deposit",
     "Withdrawal",
     "Dividend",
     "Withholding tax",
@@ -56,7 +59,7 @@ def number(value) -> Decimal:
 
 def included(product) -> bool:
     label = text(product).casefold()
-    if label == "my trades":
+    if label in {"my trades", "ikze"}:
         return True
     if label in {"investment plan", "investment plans"}:
         return False
@@ -102,7 +105,9 @@ def account_currency(sheets: dict[str, list[tuple]]) -> str:
     for rows in sheets.values():
         for row in rows:
             if row and text(row[0]).casefold() in {"account currency", "base currency"}:
-                currencies.add(text(row[1] if len(row) > 1 else None).upper())
+                value = text(row[1] if len(row) > 1 else None).upper()
+                if value:
+                    currencies.add(value)
 
     # The inspected export identifies account-value currency in this summary.
     rows = sheets["Open Positions"]
@@ -112,11 +117,14 @@ def account_currency(sheets: dict[str, list[tuple]]) -> str:
             for summary in rows[idx + 1 :]:
                 if "Instrument/Position" in summary:
                     break
-                if text(field(summary, mapping, "Product")).casefold() == "my trades":
-                    currencies.add(text(field(summary, mapping, "Currency")).upper())
+                if text(field(summary, mapping, "Product")).casefold() in {"my trades", "ikze"}:
+                    value = text(field(summary, mapping, "Currency")).upper()
+                    if value:
+                        currencies.add(value)
             break
-    if not currencies or "" in currencies:
-        raise ImportValidationError("Account currency cannot be established from the report.")
+    # Owner policy: missing currency defaults to PLN; explicit evidence is validated.
+    if not currencies:
+        return "PLN"
     if currencies != {"PLN"}:
         raise ImportValidationError(
             "Report account currency is conflicting or unsupported; only verified PLN is supported."
@@ -163,7 +171,10 @@ class XtbReportReader:
             metadata(sheets["Open Positions"], "Data as of report generated"), workbook.epoch
         )
         instruments: dict[str, InstrumentData] = {}
-        warnings = ["Account currency PLN; instrument quote currencies have not yet been resolved."]
+        warnings = [
+            "Account currency PLN (missing currency defaults to PLN by owner policy); "
+            "instrument quote currencies have not yet been resolved."
+        ]
         excluded = 0
 
         def instrument(symbol, name, category):
@@ -206,7 +217,11 @@ class XtbReportReader:
             if not included(field(row, mapping, "Product")):
                 excluded += 1
                 continue
-            if "Currency" in mapping and text(field(row, mapping, "Currency")).upper() != currency:
+            if (
+                "Currency" in mapping
+                and text(field(row, mapping, "Currency"))
+                and text(field(row, mapping, "Currency")).upper() != currency
+            ):
                 raise ImportValidationError("Cash operation currency differs from verified PLN.")
             operation_id = text(field(row, mapping, "ID"))
             if not operation_id or operation_id in seen:
@@ -219,6 +234,9 @@ class XtbReportReader:
                 )
             event = CashEvent(
                 operation_id=operation_id,
+                product="IKZE"
+                if text(field(row, mapping, "Product")).casefold() == "ikze"
+                else "MY_TRADES",
                 kind=kind,
                 occurred_at=date(field(row, mapping, "Time"), workbook.epoch),
                 amount=number(field(row, mapping, "Amount")),
@@ -236,19 +254,21 @@ class XtbReportReader:
                         f"Unsupported trade comment or identifiers at cash row {source_row}."
                     )
                 opening = kind == "Stock purchase"
-                if match[1] != ("OPEN" if opening else "CLOSE"):
+                if match["ticker"] and match["ticker"] != event.symbol:
+                    raise ImportValidationError("Trade comment ticker disagrees with row ticker.")
+                if match["direction"] != ("OPEN" if opening else "CLOSE"):
                     raise ImportValidationError("Trade type and comment direction disagree.")
                 if (opening and event.amount >= 0) or (not opening and event.amount <= 0):
                     raise ImportValidationError("Trade cash amount has an unexpected sign.")
                 event = event.model_copy(
                     update={
                         "action": "BUY" if opening else "SELL",
-                        "quantity": number(match[2]),
-                        "execution_price": number(match[4]),
+                        "quantity": number(match["quantity"]),
+                        "execution_price": number(match["price"]),
                     }
                 )
                 event = CashEvent.model_validate(event.model_dump())
-                if match[3] and event.quantity > number(match[3]):
+                if match["total"] and event.quantity > number(match["total"]):
                     raise ImportValidationError("Execution quantity exceeds contextual total.")
             if kind not in KNOWN_CASH_TYPES:
                 warnings.append(f"Unrecognized cash event type retained for review: {kind}")
@@ -345,10 +365,15 @@ class XtbReportReader:
         finish()
         if len({p.symbol for p in positions}) != len(positions):
             raise ImportValidationError(
-                "Repeated My Trades instrument summaries require explicit grouping."
+                "Repeated included instrument summaries require explicit grouping."
             )
         return BrokerReport(
             account_number=account,
+            scope="MY_TRADES_IKZE"
+            if {e.product for e in events} == {"MY_TRADES", "IKZE"}
+            else "IKZE"
+            if any(e.product == "IKZE" for e in events)
+            else "MY_TRADES",
             currency=currency,
             fingerprint=fingerprint,
             as_of=as_of,

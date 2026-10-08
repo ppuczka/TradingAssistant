@@ -3,6 +3,7 @@
 from pathlib import Path
 
 from trading_assistant.adapters.database import database_engine, migrate
+from trading_assistant.adapters.nbp import NbpFxRateProvider
 from trading_assistant.adapters.portfolio_repository import SqlAlchemyPortfolioRepository
 from trading_assistant.application.portfolio import PortfolioDashboardService
 
@@ -14,4 +15,6 @@ def repository(path: Path) -> SqlAlchemyPortfolioRepository:
 
 
 def dashboard_service(path: Path) -> PortfolioDashboardService:
-    return PortfolioDashboardService(repository(path))
+    return PortfolioDashboardService(
+        repository(path), NbpFxRateProvider(path.parent / "nbp-usd-pln.json")
+    )

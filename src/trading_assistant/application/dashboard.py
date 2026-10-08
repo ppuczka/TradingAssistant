@@ -31,9 +31,15 @@ class DashboardSnapshot(BaseModel):
     currency: str | None = None
     portfolio_value: Decimal | None = None
     cash: Decimal | None = None
+    cash_as_of: str | None = None
     today_pnl: Decimal | None = None
     total_pnl: Decimal | None = None
     valuation_as_of: str | None = None
+    holdings_value: Decimal | None = None
+    holdings_value_usd: Decimal | None = None
+    unrealized_pnl: Decimal | None = None
+    unrealized_pnl_usd: Decimal | None = None
+    fx_status: str | None = None
     positions: list[PortfolioRow] = Field(default_factory=list)
     allocation: list[AllocationRow] = Field(default_factory=list)
     opportunities: list[OpportunityRow] = Field(default_factory=list)

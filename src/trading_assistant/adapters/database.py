@@ -122,6 +122,16 @@ class ReportHolding(Base):
     lots: Mapped[list] = mapped_column(JSON)
 
 
+class CashBalance(Base):
+    __tablename__ = "cash_balances"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id"), index=True)
+    amount: Mapped[Decimal] = mapped_column(ExactDecimal())
+    currency: Mapped[str] = mapped_column(String(3))
+    as_of: Mapped[str] = mapped_column(String(40))
+    recorded_at: Mapped[str] = mapped_column(String(40))
+
+
 def database_engine(path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
     engine = create_engine(

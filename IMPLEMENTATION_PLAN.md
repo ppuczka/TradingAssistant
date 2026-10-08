@@ -8,15 +8,22 @@ service backed by a SQLite ledger. The initial M3/M4/M5 slice is implemented:
 SQLAlchemy models, Alembic migration, exact decimal storage, My Trades-only XLSX
 import, source-event deduplication, atomic commits, and ledger-to-report quantity
 reconciliation. The supplied report has been imported and repeat import verified.
-The importer requires verified PLN currency evidence and checks newly added trades
+The importer defaults missing currency to PLN by owner policy, rejects explicit
+non-PLN or conflicting currency evidence, includes My Trades and IKZE, and checks newly added trades
 against all stored snapshots for the same account before commit, including snapshots
 before and after the incoming report's as-of date.
 Market-data integration and the AnalysisEngine adapter remain unimplemented.
 Unavailable AI/navigation features show availability notices rather than running
 placeholder analyses. Synthetic tests cover CLI/dashboard behavior, imports,
 overlapping reports, rollback, account separation, precision, and database constraints.
-Report-dated values are displayed; cash balance, USD conversions, live prices, and
-daily/total performance are still unavailable. Lot-ID discrepancies are flagged,
+Report-dated holdings value and unrealized P/L are displayed in PLN and USD.
+The NBP table A adapter, typed FX boundary, Decimal conversion, one-hour cache,
+publication provenance, timeout, and explicit stale-cache fallback are implemented.
+Manual My Trades PLN cash confirmations are supported through import options and
+`trader set-cash`, with timezone-aware timestamps and an additive migration. Cash
+observations remain separate from the ledger and are not automatically advanced.
+A cash total requires a confirmation for every account. Live stock prices and
+daily/total performance remain unavailable. Lot-ID discrepancies are flagged,
 not resolved by invented trades.
 
 The project has a Python 3.13 uv environment, installed dependencies, and a
@@ -129,7 +136,7 @@ The concrete import sequence for this layout is:
    Preserve source row, product label, position ID, amount, and comment privately.
    Account base currency is confirmed as PLN for the first account. Each report
    must independently establish PLN denomination through explicit account/base
-   currency metadata or My Trades valuation summaries; unknown, conflicting, or
+   currency metadata or My Trades valuation summaries; missing values default to PLN by owner policy; conflicting or
    non-PLN denominations are rejected. Explicit cash-row currencies must agree.
    Verify broker cash-field conventions
    before assigning units to imported amounts; foreign instrument execution and
@@ -275,7 +282,7 @@ opt-in live checks for verified symbol coverage.
 The portfolio table now has a separate Value USD column in the TUI and CLI.
 `PortfolioRow.market_value_usd` is supplied by the application service; the UI
 does not calculate FX conversions. Keep the existing value and currency alongside
-it. Until valuation/FX services populate it, show an unavailable marker. Account
+it. The application service now populates it through the NBP adapter. Account
 base currency remains PLN; USD is an additional reporting currency.
 
 Start with the public [NBP API](https://api.nbp.pl/en.html), table A mid-rates,
@@ -286,7 +293,10 @@ initial USD display must be labeled as a reference conversion, not live FX or
 a broker execution rate. Intraday FX may be added behind the same provider
 interface later if needed.
 
-Implementation steps:
+The initial PLN-to-USD slice is implemented, including summary cards, cached rates,
+provenance, and mocked HTTP tests. Cross-currency conversion and historical
+reference-rate selection remain future work. The following describes the wider
+FX design as currencies and historical reporting are added:
 
 1. Define application-owned `FxRate` and `FxRateProvider` contracts. Each rate
    includes base/quote currency, positive Decimal rate, provider, publication
@@ -319,8 +329,8 @@ Implementation steps:
 
 Acceptance: known PLN amounts produce correctly directed USD conversions, all
 displayed conversions carry rate provenance, and FX requests never invoke an LLM
-or execute on the UI loop. Implement the provider/service in the valuation slice;
-this column addition alone does not start network FX fetching.
+or block the UI loop. Current refreshes request FX only when an imported report
+exists and reuse a cached rate for one hour. Cash is now available from manual current-balance confirmations; today's P/L requires market quotes and a session baseline.
 
 ## Portfolio-aware TradingAgents integration
 
@@ -474,3 +484,9 @@ Acceptance: `uv run trader analyze GE --json` invokes the configured engine and
 returns valid application-owned Recommendation JSON. This analysis slice does
 not add importing, broker execution, an opportunity scanner, or portfolio review;
 portfolio-aware review is the subsequent M7 increment.
+
+IKZE extension implemented: included IKZE rows preserve their product identity in
+cash events and import scope. IKZE deposits are recognized; optional tickers in
+OPEN/CLOSE BUY comments must match row tickers. Multiple detailed lots per ticker
+remain preserved, summed, and reconciled. Account metadata must still agree across
+all sheets. Investment Plan/Investment Plans remain excluded.

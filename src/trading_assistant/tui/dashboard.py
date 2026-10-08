@@ -58,6 +58,7 @@ class PortfolioScreen(Screen):
         with Vertical(id="portfolio-view-body"):
             yield Static("PORTFOLIO • My Trades", classes="heading")
             yield Static("Loading holdings…", id="portfolio-view-notice", markup=False)
+            yield Static("", id="portfolio-view-fx", classes="message", markup=False)
             yield DataTable(id="portfolio-view-table", cursor_type="row")
             with VerticalScroll(id="portfolio-view-alerts"):
                 yield Static("", id="portfolio-view-status", markup=False)
@@ -85,6 +86,7 @@ class PortfolioScreen(Screen):
             else "No open positions available. Import a report with trader import-xtb."
         )
         self.query_one("#portfolio-view-status", Static).update("\n".join(snapshot.alerts))
+        self.query_one("#portfolio-view-fx", Static).update(snapshot.fx_status or "")
 
     def action_back(self) -> None:
         self.app.pop_screen()
@@ -98,6 +100,7 @@ class DashboardApp(App[None]):
     Header { background: #182a3a; }
     #content { padding: 1 2; }
     #intro { height: auto; margin-bottom: 1; color: #96aaba; }
+    #fx-status { height: auto; color: #96aaba; margin-bottom: 1; }
     #metrics { grid-size: 4; grid-gutter: 1; height: 5; }
     .metric { border: round #35556e; padding: 0 1; }
     .panel { border: round #35556e; padding: 0 1; height: auto; margin-top: 1; }
@@ -136,6 +139,7 @@ class DashboardApp(App[None]):
         yield Header()
         with VerticalScroll(id="content"):
             yield Static("Loading portfolio overview…", id="intro", markup=False)
+            yield Static("", id="fx-status", markup=False)
             with Grid(id="metrics"):
                 for widget_id in ("value", "cash", "today", "total"):
                     yield Static("—", id=f"metric-{widget_id}", classes="metric")
@@ -193,14 +197,35 @@ class DashboardApp(App[None]):
             else "Welcome. No portfolio is connected yet. Values appear when data is available."
         )
         for widget_id, title, value in (
-            ("value", "Portfolio value", snapshot.portfolio_value),
+            ("value", "Holdings value", snapshot.holdings_value),
             ("cash", "Cash", snapshot.cash),
             ("today", "Today's P/L", snapshot.today_pnl),
-            ("total", "Total P/L", snapshot.total_pnl),
+            ("total", "Unrealized P/L", snapshot.unrealized_pnl),
         ):
             widget = self.home_screen.query_one(f"#metric-{widget_id}", Static)
             widget.border_title = title
-            widget.update(Text(money(value, snapshot.currency), style="bold"))
+            content = money(value, snapshot.currency)
+            usd = (
+                snapshot.holdings_value_usd
+                if widget_id == "value"
+                else snapshot.unrealized_pnl_usd
+                if widget_id == "total"
+                else None
+            )
+            if widget_id == "cash" and value is not None:
+                content += "\nConfirmed snapshot"
+            if usd is not None:
+                content += f"\n{money(usd, 'USD')}"
+            if value is None and snapshot.positions:
+                reason = {
+                    "cash": "Confirmed balance needed",
+                    "today": "Live quotes needed",
+                    "total": "Report P/L unavailable",
+                    "value": "Valuation unavailable",
+                }[widget_id]
+                content += f"\n{reason}"
+            widget.update(Text(content, style="bold"))
+        self.home_screen.query_one("#fx-status", Static).update(snapshot.fx_status or "")
 
         populate_portfolio(self.home_screen.query_one("#portfolio-table", DataTable), snapshot)
         self.home_screen.query_one("#portfolio-empty", Static).update(

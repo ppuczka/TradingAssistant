@@ -1,7 +1,7 @@
 """Atomic imports and portfolio read model over an event ledger."""
 
 from collections import defaultdict
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 
 from sqlalchemy import select
@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from trading_assistant.adapters.database import (
     Account,
+    CashBalance,
     CashOperation,
     ImportBatch,
     Instrument,
@@ -17,6 +18,7 @@ from trading_assistant.adapters.database import (
 )
 from trading_assistant.domain.portfolio import (
     BrokerReport,
+    CashBalanceInput,
     Holding,
     ImportResult,
     ImportValidationError,
@@ -56,7 +58,34 @@ class SqlAlchemyPortfolioRepository:
     def __init__(self, engine):
         self.engine = engine
 
-    def import_report(self, report: BrokerReport) -> ImportResult:
+    def set_cash_balance(self, account_number: str, balance: CashBalanceInput) -> None:
+        with Session(self.engine) as session, session.begin():
+            account = session.scalar(
+                select(Account).where(
+                    Account.broker == "XTB", Account.broker_account_id == account_number
+                )
+            )
+            if account is None:
+                raise ImportValidationError("Unknown account; import its report first.")
+            self._save_cash_balance(session, account, balance)
+
+    @staticmethod
+    def _save_cash_balance(session, account, balance: CashBalanceInput) -> None:
+        if account.currency != "PLN":
+            raise ImportValidationError("Only PLN cash balances are supported.")
+        session.add(
+            CashBalance(
+                account_id=account.id,
+                amount=balance.amount,
+                currency=account.currency,
+                as_of=stamp(balance.as_of),
+                recorded_at=stamp(datetime.now(UTC)),
+            )
+        )
+
+    def import_report(
+        self, report: BrokerReport, cash_balance: CashBalanceInput | None = None
+    ) -> ImportResult:
         with Session(self.engine) as session, session.begin():
             account = session.scalar(
                 select(Account).where(
@@ -72,6 +101,8 @@ class SqlAlchemyPortfolioRepository:
                 session.flush()
             if account.currency != report.currency:
                 raise ImportValidationError("Account currency conflicts with existing records.")
+            if cash_balance is not None:
+                self._save_cash_balance(session, account, cash_balance)
             previous = session.scalar(
                 select(ImportBatch).where(
                     ImportBatch.account_id == account.id,
@@ -90,7 +121,7 @@ class SqlAlchemyPortfolioRepository:
                 account_id=account.id,
                 fingerprint=report.fingerprint,
                 as_of=stamp(report.as_of),
-                scope="MY_TRADES",
+                scope=report.scope,
                 excluded_rows=report.excluded_rows,
                 warnings=list(report.warnings),
                 closed_records=report.closed_records,
@@ -124,6 +155,9 @@ class SqlAlchemyPortfolioRepository:
             )
             for source in report.cash_events:
                 payload = source.model_dump(mode="json", exclude={"source_row"})
+                # Preserve payload compatibility with previously imported My Trades events.
+                if source.product == "MY_TRADES":
+                    payload.pop("product")
                 for key in ("amount", "quantity", "execution_price"):
                     if payload.get(key) is not None:
                         payload[key] = format(Decimal(payload[key]).normalize(), "f")
@@ -149,7 +183,7 @@ class SqlAlchemyPortfolioRepository:
                     kind=source.kind,
                     amount=source.amount,
                     currency=report.currency,
-                    product="MY_TRADES",
+                    product=source.product,
                     position_id=source.position_id,
                     payload={"event": payload, "source_row": source.source_row},
                 )
@@ -173,7 +207,7 @@ class SqlAlchemyPortfolioRepository:
             observed = {instrument_ids[p.symbol]: p.quantity for p in report.positions}
             if not quantities_match(derived, observed):
                 raise ImportValidationError(
-                    "Ledger quantities do not reconcile to the My Trades open-position snapshot. "
+                    "Ledger quantities do not reconcile to the included open-position snapshot. "
                     "Import complete history or establish explicit opening balances; "
                     "no rows were saved."
                 )
@@ -233,7 +267,28 @@ class SqlAlchemyPortfolioRepository:
         with Session(self.engine) as session:
             holdings: dict[int, Holding] = {}
             state = PortfolioState()
-            for account in session.scalars(select(Account).order_by(Account.id)):
+            accounts = list(session.scalars(select(Account).order_by(Account.id)))
+            confirmed_total = Decimal(0)
+            all_confirmed = bool(accounts)
+            for account in accounts:
+                balance = session.scalar(
+                    select(CashBalance)
+                    .where(CashBalance.account_id == account.id)
+                    .order_by(CashBalance.as_of.desc(), CashBalance.id.desc())
+                )
+                if balance is None:
+                    all_confirmed = False
+                    state.warnings.append(
+                        f"Account {account.broker_account_id}: cash balance not confirmed."
+                    )
+                else:
+                    confirmed_total += balance.amount
+                    state.cash_balance_dates.append(datetime.fromisoformat(balance.as_of))
+                    state.warnings.append(
+                        f"Account {account.broker_account_id}: confirmed My Trades cash "
+                        f"{balance.amount:,.2f} PLN as of {balance.as_of}; "
+                        "a manual snapshot, not automatically updated by imports."
+                    )
                 batch = session.scalar(
                     select(ImportBatch)
                     .where(
@@ -257,6 +312,11 @@ class SqlAlchemyPortfolioRepository:
                         continue
                     instrument = session.get(Instrument, instrument_id)
                     report = observations.get(instrument_id)
+                    pnl = None
+                    if report and report.lots and all(lot.get("Net Profit") for lot in report.lots):
+                        values = [Decimal(lot["Net Profit"]) for lot in report.lots]
+                        if all(value.is_finite() for value in values):
+                            pnl = sum(values, Decimal(0))
                     if instrument_id not in holdings:
                         holdings[instrument_id] = Holding(
                             symbol=instrument.broker_symbol,
@@ -265,6 +325,7 @@ class SqlAlchemyPortfolioRepository:
                             quantity=quantity,
                             report_value=report.market_value if report else None,
                             report_pnl_percent=report.pnl_percent if report else None,
+                            report_pnl_amount=pnl,
                         )
                     else:
                         existing = holdings[instrument_id]
@@ -275,6 +336,11 @@ class SqlAlchemyPortfolioRepository:
                             else None
                         )
                         existing.report_pnl_percent = None
+                        existing.report_pnl_amount = (
+                            existing.report_pnl_amount + pnl
+                            if existing.report_pnl_amount is not None and pnl is not None
+                            else None
+                        )
                 for cash in session.scalars(
                     select(CashOperation).where(
                         CashOperation.account_id == account.id,
@@ -282,6 +348,7 @@ class SqlAlchemyPortfolioRepository:
                     )
                 ):
                     state.cash_movement += cash.amount
+            state.cash_balance = confirmed_total if all_confirmed else None
             state.holdings = sorted(holdings.values(), key=lambda h: h.symbol)
             state.warnings = sorted(set(state.warnings))
             return state
