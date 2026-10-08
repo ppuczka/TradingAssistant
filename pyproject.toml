@@ -1,0 +1,58 @@
+[build-system]
+requires = ["hatchling>=1.26,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "trading-assistant"
+version = "0.1.0"
+description = "Local-first personal AI portfolio and trading assistant"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "tradingagents==0.6.0",
+    "openai>=2,<3",
+    "typer>=0.21,<1",
+    "rich>=14,<15",
+    "textual>=1,<8",
+    "sqlalchemy>=2.0,<3",
+    "alembic>=1.14,<2",
+    "pydantic>=2.10,<3",
+    "pydantic-settings>=2.7,<3",
+    "pandas>=3.0.6,<4",
+    "openpyxl>=3.1,<4",
+    "httpx>=0.28,<1",
+    "structlog>=25,<27",
+    "pyyaml>=6,<7",
+    "python-dotenv>=1,<2",
+]
+
+[project.scripts]
+trader = "trading_assistant.cli:app"
+
+[dependency-groups]
+dev = [
+    "pytest>=8,<10",
+    "pytest-asyncio>=1,<2",
+    "ruff>=0.16,<1",
+]
+
+# Keep TradingAgents external and pin the inspected upstream revision.
+[tool.uv.sources]
+tradingagents = { git = "https://github.com/TauricResearch/TradingAgents.git", rev = "1394a3f72aa4393e1a98f51b382434c4b4c2d972" }
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/trading_assistant"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers -m 'not integration'"
+asyncio_mode = "auto"
+markers = [
+    "integration: opt-in tests requiring network access or paid model calls",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
