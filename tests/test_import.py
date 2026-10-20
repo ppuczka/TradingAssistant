@@ -762,6 +762,7 @@ def test_account_alias_cli_and_import_dry_run(report_path, tmp_path):
     assert runner.invoke(app, base + ["set-cash", "100", "--account", "ikze"]).exit_code == 0
     assert runner.invoke(app, base + ["add-money", "25", "--account", "IKZE"]).exit_code == 0
     assert open_repository(database).portfolio().account_value == 125
+
     # WAL checkpointing may change file headers without changing persisted data.
     def stored_content():
         with closing(sqlite3.connect(database)) as connection:
