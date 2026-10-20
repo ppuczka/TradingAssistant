@@ -33,6 +33,9 @@ Ask the owner before making an architectural change that contradicts these rules
 - Initially use SQLite, SQLAlchemy 2, and Alembic. Enable WAL and foreign keys
   on connections. Permit a future PostgreSQL implementation without rewriting domain logic.
 - Preserve account identity, instrument identity, monetary currency, and precision.
+- Manually entered balances are total account values INCLUDING holdings. Calculate
+  reserve as total minus report holdings; never add holdings to the entered total.
+  Missing or inconsistent valuations must leave reserve unknown, not zero.
 - Preserve broker and canonical symbols separately. Centralize conversion in a
   `SymbolResolver`: broker symbol -> canonical instrument -> provider symbol.
   Do not blindly pass XTB symbols to providers or scatter suffix-stripping rules.

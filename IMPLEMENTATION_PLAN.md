@@ -5,14 +5,27 @@
 The first read-only Textual dashboard is implemented. `uv run trader` opens it;
 `uv run trader portfolio` shows the CLI overview. Both consume an application
 service backed by a SQLite ledger. The initial M3/M4/M5 slice is implemented:
-SQLAlchemy models, Alembic migration, exact decimal storage, My Trades-only XLSX
+SQLAlchemy models, Alembic migration, exact decimal storage, My Trades/IKZE XLSX
 import, source-event deduplication, atomic commits, and ledger-to-report quantity
 reconciliation. The supplied report has been imported and repeat import verified.
 The importer defaults missing currency to PLN by owner policy, rejects explicit
 non-PLN or conflicting currency evidence, includes My Trades and IKZE, and checks newly added trades
 against all stored snapshots for the same account before commit, including snapshots
 before and after the incoming report's as-of date.
-Market-data integration and the AnalysisEngine adapter remain unimplemented.
+Market-data integration and the AnalysisEngine/TradingAgents adapter are implemented.
+`trader analyze GE` supports US stocks with imported portfolio context, strategy,
+horizon, configured models, strict rating normalization and ignored local records.
+Paid runs require OPENAI_API_KEY; tests use fake engines. TradingAgents remains an
+external pinned dependency. The dashboard reads saved owned-position recommendations without model calls.
+The A key opens a selected-US-holding analysis dialog with strategy/horizon and
+an explicit Run analysis button, using the same service and local result store.
+US portfolio review is implemented through `trader review` and the R dialog, with
+a frozen context, sequential analyses, per-symbol failures and stop-after-current.
+EU review (verified German/UK listings, excluding Poland) is implemented, including
+ETF/ETC market/news analysis and central provider mappings. SQLite AI history and
+recommendation performance evaluation remain follow-up work.
+PL review is implemented for verified PKO, XTB and PZU ETF Warsaw listings,
+with stock/fund pipelines and the PL selector in the R dialog.
 Unavailable AI/navigation features show availability notices rather than running
 placeholder analyses. Synthetic tests cover CLI/dashboard behavior, imports,
 overlapping reports, rollback, account separation, precision, and database constraints.
@@ -22,8 +35,8 @@ publication provenance, timeout, and explicit stale-cache fallback are implement
 Manual My Trades PLN cash confirmations are supported through import options and
 `trader set-cash`, with timezone-aware timestamps and an additive migration. Cash
 observations remain separate from the ledger and are not automatically advanced.
-A cash total requires a confirmation for every account. Live stock prices and
-daily/total performance remain unavailable. Lot-ID discrepancies are flagged,
+A cash total requires a confirmation for every account. Live stock prices and estimated daily changes are available; audited account
+performance remains unavailable. Lot-ID discrepancies are flagged,
 not resolved by invented trades.
 
 The project has a Python 3.13 uv environment, installed dependencies, and a
@@ -515,3 +528,130 @@ all sheets. Investment Plan/Investment Plans remain excluded.
   explicitly verified Yahoo mappings. Finnhub US routing remains unchanged.
 - Validate returned identity and currency and reject missing/invalid quote fields.
   No quote persistence, broker execution or new performance calculation.
+
+## Candidate discovery slice
+
+Implemented `trader candidates --market US,PL --limit 20 [--json]` through an
+application CandidateService and YahooCandidateProvider. Validates equity/listing
+identity, applies explicit market-cap/average-volume filters, excludes mapped
+holdings, deduplicates symbols and bounds pagination. Saves ignored local snapshots
+without LLM calls. Live US/PL screening verified with 20 candidates per market.
+Issuer-level deduplication, XTB instrument validation, sector/exposure enrichment,
+and a comparative shortlist over the entire fetched pool follow separately. The S dashboard shortcut now opens
+a candidate view with market/count controls and explicit Fetch candidates action,
+using the same service and persistence as the CLI without model calls.
+
+## Bounded AI opportunity review
+
+Implemented portfolio-aware TradingAgents analysis from the S candidate view and
+`trader opportunities`. Explicit paid start, strategy/horizon, default 3 and max 10
+analyses; sequential execution and stop after current. Uses first eligible candidates
+in Yahoo order, not an AI pre-ranking of the pool. One portfolio snapshot per batch,
+centralized Yahoo listing validation, owned/stale exclusions, US/PL stock support.
+Saves normalized BUY/WATCH/IGNORE recommendations and full reports; groups results
+by action without invented confidence. No broker orders or availability claims.
+
+## Analysis progress
+
+Optional application-owned AnalysisProgress events preserve the base AnalysisEngine
+contract. TradingAgents adapter observes its installed model callbacks and bridges
+worker-thread events to the async loop; no TradingAgents source modifications.
+Single and batch TUI dialogs display activity, elapsed time, stage, and completed
+model-call count. Batch bars count finished attempts, with explicit failed/stopped
+statuses. No estimated percentages/ETA for variable tool or debate rounds.
+
+## Saved opportunity reviews
+
+Implemented W dashboard view and S Saved reviews button: latest per symbol or all
+saved opportunity analyses, run date/strategy/horizon, and full-report access.
+Application history service reads validated local records without engine creation,
+network requests or keys. Dashboard Opportunities loads latest unowned results and
+excludes currently held instruments; CLI parity via `trader opportunity-reviews`.
+Owned-position recommendation loading remains separate. Invalid/future records
+are ignored; earlier runs remain available.
+
+## Manual candidate selection
+
+Fetched candidate rows support Space/Enter toggles, visible checkbox markers and
+selection count. Analyze selected sends only marked candidates to the existing
+portfolio-aware review service; paid start remains explicit. All eligible selected
+candidates (up to 10) are included, with no implicit first-three cutoff. Selection
+persists when returning from review and resets on refetch. CLI bounded discovery
+behavior remains unchanged.
+
+## Opportunity recommendation strength
+
+Expose the persisted five-level TradingAgents engine rating in active/saved review
+tables, dashboard opportunities and CLI results. Shared application sorting orders
+by action and engine rating, distinguishing Buy from Overweight. All-history mode
+remains chronological. No invented numeric confidence or new model calls; existing
+records already supply the engine rating.
+
+## Report-based portfolio concentration and cash warnings
+
+Implemented deterministic application assessment and typed summary/settings.
+Report values plus confirmed cash determine largest-position and top-five weights
+and cash reserve. Unknown cash produces incomplete, holdings-only concentration;
+incomplete valuations produce unavailable status. YAML/env thresholds (20/60/10
+defaults), precise Decimal arithmetic, warnings in Alerts, summary in AI Status,
+and local `trader risk [--json]`. Listing-market/instrument allocation remains
+available from portfolio services. This is an informational first risk slice;
+execution gates, sector overlap, volatility and AI market sentiment follow later.
+
+## Corrected account balance semantics
+
+Entered balances are total account values INCLUDING holdings, by owner policy.
+Shared application balance calculation derives reserve = total − report holdings.
+Dashboard total/reserve labels, allocation, concentration denominator, cash warnings
+and AI context use this meaning. New `set-account-value` / `--account-value` CLI
+with legacy command/flag aliases; deposits increase totals. Existing persisted
+amounts/table names and historical AI contexts are retained. Missing valuations or
+per-account totals below holdings yield unknown reserve, never a fabricated zero.
+
+## Portfolio-linked market sentiment and risk assessment view
+
+Implemented M view with saved US/PL sentiment, source/coverage/timestamp details,
+and existing deterministic report-risk metrics/warnings. Explicit evidence refresh
+and paid Generate action; configurable quick-model OpenAI Responses structured
+output behind SentimentEngine. Local ignored append-only result/evidence history,
+latest summary on dashboard without paid polling, stale label, CLI saved/dry-run/
+generate modes. Strict citation/market identity checks, empty evidence fails before
+model calls, missing market requires UNKNOWN. Portfolio sample only, not broad
+market breadth; benchmark/sector/macro coverage remains future work. Existing
+TradingAgents analysis boundary and broker restrictions are unchanged.
+
+## Outside-hours day change
+
+Added exchange-calendars session adapter (NYSE, Warsaw, Xetra, London) behind an
+application session-provider protocol, centrally mapped from broker symbols.
+Production dashboard accepts current-session quotes while open, or latest completed
+session near-close quotes outside hours. Session date/status visible; holidays,
+DST and early closes handled by calendars. Old intraday/extended-hours snapshots
+remain unknown. Prior-session display does not write artificial current-day history.
+
+## Quote-updated estimated position P/L
+
+Added report-anchored estimated P/L amount/percentage, provider-independent Decimal
+calculation, current quote valuation converted to PLN, GBp/GBX normalization, and
+explicitly unknown values for missing basis/FX. Both TUI tables and CLI expose
+estimates beside historical report P/L, with red/green TUI amounts and percentages.
+Assumes unchanged reported positions/costs; broker ledger cost accounting remains
+a future improvement. Existing report snapshots/risk/history remain unchanged.
+
+## Intraday history regression after outside-hours display
+
+Separated observed minute recording from daily-summary updates via an explicit
+repository option. Mixed/prior sessions keep the intraday graph moving while daily
+summary writes are suppressed. Session identities join the comparison context so
+new session baselines form segment breaks; old observations remain persisted.
+
+### Opportunity reanalysis and typed symbols
+
+Implemented: dashboard **T** and saved reviews **W → Analyze symbol** open a
+symbol-entry dialog. **W → Retry analysis** reuses a selected saved symbol,
+strategy, and horizon, with editable controls. Yahoo listing verification precedes
+analysis; supported US, Warsaw, German, and London stocks/ETFs use centralized
+symbol resolution. Each run reads current portfolio context and uses today's date.
+Owned symbols receive owned-position analysis. Explicit Run starts paid analysis;
+saved reports remain available and retries append history. CLI supports
+`trader analyze SYMBOL --lookup` (metadata lookup also runs with `--dry-run`).

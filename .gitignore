@@ -20,5 +20,6 @@ reports/
 broker_reports/
 imports/
 results/
+analysis/
 logs/
 .DS_Store

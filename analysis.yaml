@@ -1,0 +1,10 @@
+# Model identifiers and engine limits belong to configuration, not application code.
+llm_provider: openai
+quick_model: gpt-6-luna
+deep_model: gpt-6-sol
+default_horizon: 3-5 years
+max_debate_rounds: 1
+max_risk_rounds: 1
+max_tool_rounds: 20
+reasoning_effort: medium
+max_tokens: 8192

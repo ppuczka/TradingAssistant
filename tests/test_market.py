@@ -154,7 +154,7 @@ async def test_initial_snapshot_does_not_wait_for_external_data():
                     )
                 ],
                 report_dates=[datetime.now(UTC)],
-                cash_balance=Decimal("50"),
+                account_value=Decimal("1050"),
             )
 
     class SlowProvider:

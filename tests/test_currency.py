@@ -171,7 +171,9 @@ async def test_nbp_eur_gbp_cache_and_identity(tmp_path):
     assert calls == ["EUR", "GBP"]
 
 
-@pytest.mark.parametrize("missing,old_quote", [(False, False), (True, False), (False, True)])
+@pytest.mark.parametrize(
+    "missing,old_quote", [(False, False), (True, False), (False, True), (False, "mixed")]
+)
 async def test_daily_summary_multi_currency_and_missing_coverage(missing, old_quote):
     from trading_assistant.domain.market import MarketDataError, Quote
 
@@ -189,7 +191,8 @@ async def test_daily_summary_multi_currency_and_missing_coverage(missing, old_qu
             if missing and symbol.startswith("BBB"):
                 raise MarketDataError("unavailable")
             currency = {"AAA": "USD", "BBB": "EUR", "CCC": "GBp", "DDD": "PLN"}[symbol[:3]]
-            as_of = datetime.now(UTC) - timedelta(days=1 if old_quote else 0)
+            older = old_quote is True or (old_quote == "mixed" and symbol.startswith("AAA"))
+            as_of = datetime.now(UTC) - timedelta(days=1 if older else 0)
             return Quote(
                 symbol=symbol,
                 name="Provider full name",
@@ -212,10 +215,65 @@ async def test_daily_summary_multi_currency_and_missing_coverage(missing, old_qu
         Repository(), Fx(), Provider(), Provider()
     ).snapshot()
     assert snapshot.positions[0].name == "Provider full name"
-    if missing or old_quote:
+    for position in snapshot.positions:
+        yesterday = old_quote is True or (old_quote == "mixed" and position.symbol == "AAA.US")
+        unavailable = missing and position.symbol == "BBB.DE"
+        if yesterday or unavailable:
+            assert position.quote_daily_change_percent is None
+            assert position.quote_daily_change is None
+        else:
+            assert position.quote_daily_change_percent == Decimal("10")
+    if old_quote is True:
         assert snapshot.today_pnl is None
         assert "unavailable" in snapshot.today_pnl_status
+        assert snapshot.today_pnl_covered == 0
+    elif old_quote == "mixed":
+        assert snapshot.today_pnl == Decimal("121.2")
+        assert snapshot.today_pnl_covered == 3
+        assert "Partial estimate" in snapshot.today_pnl_status
+    elif missing:
+        assert snapshot.today_pnl == Decimal("101.2")
+        assert snapshot.today_pnl_covered == 3
+        assert "Partial estimate" in snapshot.today_pnl_status
+        assert "3/4 holdings" in snapshot.today_pnl_status
     else:
         # 20 USD * 4 + 20 EUR * 5 + 20 pence / 100 * 6 + 20 PLN
         assert snapshot.today_pnl == Decimal("201.2")
+        assert snapshot.today_pnl_covered == 4
         assert "excludes trades" in snapshot.today_pnl_status
+    assert snapshot.today_pnl_total == 4
+
+
+async def test_daily_percentage_uses_value_weighting_and_excludes_cash():
+    from trading_assistant.domain.market import Quote
+
+    class Repository:
+        def portfolio(self):
+            return PortfolioState(
+                holdings=[
+                    Holding(symbol="AAA.US", name="A", asset_type="STOCK", quantity="1"),
+                    Holding(symbol="BBB.US", name="B", asset_type="STOCK", quantity="9"),
+                ],
+                account_value=Decimal("100000"),
+                report_dates=[datetime.now(UTC)],
+            )
+
+    class Provider:
+        async def quote(self, symbol):
+            return Quote(
+                symbol=symbol,
+                currency="USD",
+                price="200" if symbol == "AAA" else "110",
+                previous_close="100",
+                as_of=datetime.now(UTC),
+                retrieved_at=datetime.now(UTC),
+                source="Test",
+            )
+
+    class Fx:
+        async def usd_pln(self):
+            return rate()
+
+    snapshot = await PortfolioDashboardService(Repository(), Fx(), Provider()).snapshot()
+    assert snapshot.today_change_percent == Decimal("19")
+    assert snapshot.day_change_percent_history[0].close == 19
