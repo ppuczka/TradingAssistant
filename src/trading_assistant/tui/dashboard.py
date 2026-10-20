@@ -1,7 +1,10 @@
 """Presentation only: render the snapshot supplied by an application service."""
 
 import asyncio
+import json
+from collections.abc import Callable
 from decimal import Decimal
+from pathlib import Path
 
 from rich.text import Text
 from textual import work
@@ -12,6 +15,18 @@ from textual.screen import Screen
 from textual.widgets import DataTable, Footer, Header, Static
 
 from trading_assistant.application.dashboard import DashboardService, DashboardSnapshot
+from trading_assistant.domain.analysis import AnalysisFailure, Strategy
+from trading_assistant.tui.analysis_modal import AnalysisModal
+from trading_assistant.tui.candidate_modal import CandidateModal
+from trading_assistant.tui.column_selector import ColumnSelector
+from trading_assistant.tui.daily_dashboard import DailyDashboard
+from trading_assistant.tui.day_chart import DayChangeChart
+from trading_assistant.tui.full_analysis import FullAnalysisView
+from trading_assistant.tui.market_assessment import MarketAssessmentView
+from trading_assistant.tui.news_panel import NewsPanel
+from trading_assistant.tui.opportunity_history import OpportunityHistoryView
+from trading_assistant.tui.opportunity_modal import OpportunityModal
+from trading_assistant.tui.review_modal import ReviewModal
 
 
 def money(value: Decimal | None, currency: str | None) -> str:
@@ -36,14 +51,24 @@ PORTFOLIO_COLUMNS = (
     "QUOTE PRICE",
     "QUOTE VALUE",
     "DAY CHANGE %",
+    "EST. P/L PLN",
+    "EST. P/L %",
     "AI",
 )
 
 
 def populate_portfolio(table: DataTable, snapshot: DashboardSnapshot) -> None:
-    table.clear()
+    selected = str(table.get_row_at(table.cursor_row)[0]) if table.row_count else None
+    hidden = getattr(table.app, "hidden_portfolio_columns", set())
+    visible = [i for i, name in enumerate(PORTFOLIO_COLUMNS) if name not in hidden]
+    headers = [PORTFOLIO_COLUMNS[i] for i in visible]
+    if [str(column.label) for column in table.columns.values()] != headers:
+        table.clear(columns=True)
+        table.add_columns(*headers)
+    else:
+        table.clear()
     for position in snapshot.positions:
-        table.add_row(
+        cells = (
             Text(position.symbol),
             Text(position.name),
             str(position.quantity) if position.quantity is not None else "—",
@@ -53,8 +78,23 @@ def populate_portfolio(table: DataTable, snapshot: DashboardSnapshot) -> None:
             money(position.quote_price, position.quote_currency),
             money(position.quote_value, position.quote_currency),
             percent(position.quote_daily_change_percent),
+            Text(
+                f"{position.estimated_pnl_pln:+,.2f}"
+                if position.estimated_pnl_pln is not None
+                else "—",
+                style=("green" if position.estimated_pnl_pln >= 0 else "red")
+                if position.estimated_pnl_pln is not None
+                else "",
+            ),
+            percent(position.estimated_pnl_percent),
             Text(position.recommendation or "—"),
         )
+        table.add_row(*(cells[i] for i in visible))
+    if selected:
+        for index, position in enumerate(snapshot.positions):
+            if position.symbol == selected:
+                table.move_cursor(row=index)
+                break
 
 
 class PortfolioScreen(Screen):
@@ -70,6 +110,7 @@ class PortfolioScreen(Screen):
         self.service = service
         self.refresh_lock = asyncio.Lock()
         self.initial_load = True
+        self.last_snapshot = None
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -101,6 +142,7 @@ class PortfolioScreen(Screen):
             if self.initial_load and initial_snapshot is not None:
                 self.initial_load = False
                 initial = await initial_snapshot()
+                self.last_snapshot = initial
                 populate_portfolio(self.query_one(DataTable), initial)
                 notice.update("Read-only portfolio • Loading market data…")
                 self.query_one("#portfolio-view-fx", Static).update(initial.market_status or "")
@@ -108,6 +150,7 @@ class PortfolioScreen(Screen):
         except Exception:
             notice.update("Unable to refresh holdings. Displayed values may be stale. F5 retries.")
             return
+        self.last_snapshot = snapshot
         populate_portfolio(self.query_one(DataTable), snapshot)
         notice.update(
             f"Report values as of {snapshot.valuation_as_of} • Read-only"
@@ -135,6 +178,11 @@ class DashboardApp(App[None]):
     #intro { height: auto; margin-bottom: 1; color: #96aaba; }
     #fx-status { height: auto; color: #96aaba; margin-bottom: 1; }
     #metrics { grid-size: 4; grid-gutter: 1; height: 5; }
+    #day-change-chart { height: auto; min-height: 1; }
+    #daily-dashboard-body { padding: 1 2; }
+    #daily-summary { height: auto; margin-bottom: 1; text-style: bold; }
+    #daily-percent-chart, #daily-pln-chart { height: auto; }
+    #daily-history-table { height: auto; max-height: 15; min-height: 3; }
     .metric { border: round #35556e; padding: 0 1; }
     .panel { border: round #35556e; padding: 0 1; height: auto; margin-top: 1; }
     .heading { color: #75c6ed; text-style: bold; height: 1; margin-bottom: 1; }
@@ -144,6 +192,8 @@ class DashboardApp(App[None]):
     #details > .panel { min-height: 9; }
     #opportunities-table { height: auto; max-height: 9; min-height: 3; }
     #allocation, #ai-status, #alerts { height: auto; }
+    #news-panel { height: auto; max-height: 18; min-height: 3; }
+    #news-panel Link { height: auto; margin-bottom: 1; }
     #portfolio-view-body { padding: 1 2; }
     #portfolio-view-notice { height: auto; margin-bottom: 1; color: #96aaba; }
     #portfolio-view-table { height: 1fr; }
@@ -154,19 +204,55 @@ class DashboardApp(App[None]):
     """
     BINDINGS = [
         Binding("q", "quit", "Quit", priority=True),
+        Binding("ctrl+l", "columns", "Columns", priority=True),
         Binding("f5", "refresh", "Refresh"),
         Binding("p", "portfolio", "Portfolio", priority=True),
-        Binding("a", "unavailable('Analysis')", "Analyze"),
-        Binding("s", "unavailable('Opportunity scan')", "Scan"),
-        Binding("r", "unavailable('Portfolio review')", "Review"),
+        Binding("ctrl+p", "return_portfolio", "Back to Portfolio", priority=True),
+        Binding("d", "daily_dashboard", "Daily dashboard", priority=True),
+        Binding("a", "analyze", "Analyze", priority=True),
+        Binding("t", "typed_analysis", "Analyze symbol", priority=True),
+        Binding("v", "full_analysis", "Full analysis", priority=True),
+        Binding("s", "candidates", "Candidates", priority=True),
+        Binding("r", "review", "Review", priority=True),
+        Binding("w", "opportunity_history", "Saved opportunities", priority=True),
+        Binding("m", "market_assessment", "Markets / Risk", priority=True),
         Binding("h", "unavailable('Recommendation history')", "History"),
         Binding("o", "unavailable('Orders')", "Orders"),
         Binding("c", "unavailable('Configuration')", "Config"),
     ]
 
-    def __init__(self, service: DashboardService) -> None:
+    def __init__(
+        self,
+        service: DashboardService,
+        *,
+        analysis_factory: Callable | None = None,
+        candidate_factory: Callable | None = None,
+        opportunity_history_factory: Callable | None = None,
+        sentiment_factory: Callable | None = None,
+        preferences_path: Path | None = None,
+    ) -> None:
         super().__init__()
         self.service = service
+        self.sentiment_factory = sentiment_factory
+        self.preferences_path = preferences_path
+        self.hidden_portfolio_columns = set()
+        if preferences_path:
+            try:
+                preferences = json.loads(preferences_path.read_text())
+                hidden = preferences.get("hidden_portfolio_columns", [])
+                if isinstance(hidden, list):
+                    self.hidden_portfolio_columns = {
+                        name
+                        for name in hidden
+                        if isinstance(name, str) and name in PORTFOLIO_COLUMNS and name != "SYMBOL"
+                    }
+            except (OSError, ValueError, AttributeError):
+                pass
+        self.last_snapshot = None
+        self.analysis_factory = analysis_factory
+        self.candidate_factory = candidate_factory
+        self.opportunity_history_factory = opportunity_history_factory
+        self.candidate_service = None
         self.refresh_lock = asyncio.Lock()
         self.initial_load = True
 
@@ -178,6 +264,9 @@ class DashboardApp(App[None]):
             with Grid(id="metrics"):
                 for widget_id in ("value", "cash", "today", "total"):
                     yield Static("—", id=f"metric-{widget_id}", classes="metric")
+            with Vertical(classes="panel"):
+                yield Static("DAY CHANGE HISTORY", classes="heading")
+                yield DayChangeChart(id="day-change-chart")
             with Vertical(classes="panel"):
                 yield Static("PORTFOLIO", classes="heading")
                 yield DataTable(id="portfolio-table", cursor_type="row")
@@ -194,6 +283,9 @@ class DashboardApp(App[None]):
                 yield DataTable(id="opportunities-table", cursor_type="row")
                 yield Static("", id="opportunities-empty", classes="message", markup=False)
             with Vertical(classes="panel"):
+                yield Static("PORTFOLIO NEWS", classes="heading")
+                yield NewsPanel(id="news-panel")
+            with Vertical(classes="panel"):
                 yield Static("ALERTS", classes="heading")
                 yield Static("", id="alerts", markup=False)
         yield Footer()
@@ -202,17 +294,86 @@ class DashboardApp(App[None]):
         self.home_screen = self.screen
         self.query_one("#portfolio-table", DataTable).add_columns(*PORTFOLIO_COLUMNS)
         self.query_one("#opportunities-table", DataTable).add_columns(
-            "SYMBOL", "ACTION", "CONFIDENCE"
+            "SYMBOL", "ACTION", "ENGINE RATING", "SUGGESTED ENTRY", "STOP LOSS"
         )
         self.set_class(self.size.width < 100, "compact")
         self.action_refresh()
         self.set_interval(5, self.refresh_active_screen)
 
     def refresh_active_screen(self) -> None:
-        if isinstance(self.screen, PortfolioScreen):
+        if isinstance(
+            self.screen,
+            (
+                AnalysisModal,
+                FullAnalysisView,
+                ReviewModal,
+                CandidateModal,
+                OpportunityModal,
+                OpportunityHistoryView,
+                MarketAssessmentView,
+                ColumnSelector,
+            ),
+        ):
+            return
+        if isinstance(self.screen, (PortfolioScreen, DailyDashboard)):
             self.screen.action_refresh()
         else:
             self.action_refresh()
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        if action == "return_portfolio":
+            return True
+        if isinstance(
+            self.screen,
+            (
+                AnalysisModal,
+                FullAnalysisView,
+                ReviewModal,
+                CandidateModal,
+                OpportunityModal,
+                OpportunityHistoryView,
+                MarketAssessmentView,
+                ColumnSelector,
+            ),
+        ):
+            return False
+        return True
+
+    def action_candidates(self) -> None:
+        if self.candidate_factory is None:
+            self.notify("Candidate discovery is not configured.", severity="warning")
+            return
+        try:
+            if self.candidate_service is None:
+                self.candidate_service = self.candidate_factory()
+            self.push_screen(
+                CandidateModal(
+                    self.candidate_service, self.analysis_factory, self.opportunity_history_factory
+                )
+            )
+        except Exception:
+            self.notify("Unable to prepare candidate discovery.", severity="error")
+
+    def action_opportunity_history(self) -> None:
+        if self.opportunity_history_factory is None:
+            self.notify("Saved opportunity reviews are not configured.", severity="warning")
+            return
+        try:
+            self.push_screen(
+                OpportunityHistoryView(self.opportunity_history_factory(), self.analysis_factory)
+            )
+        except Exception:
+            self.notify("Unable to open saved opportunity reviews.", severity="error")
+
+    def action_market_assessment(self):
+        if self.sentiment_factory is None:
+            self.notify("Market assessment is not configured.", severity="warning")
+            return
+        self.push_screen(
+            MarketAssessmentView(
+                self.sentiment_factory(False), lambda: self.sentiment_factory(True)
+            )
+        )
 
     def on_resize(self) -> None:
         self.set_class(self.size.width < 100, "compact")
@@ -241,6 +402,9 @@ class DashboardApp(App[None]):
         self.render_snapshot(snapshot)
 
     def render_snapshot(self, snapshot: DashboardSnapshot) -> None:
+        self.last_snapshot = snapshot
+        self.home_screen.query_one("#news-panel", NewsPanel).set_snapshot(snapshot)
+        self.home_screen.query_one("#day-change-chart", DayChangeChart).set_snapshot(snapshot)
         self.home_screen.query_one("#intro", Static).update(
             f"Portfolio overview • Read-only • Report values as of {snapshot.valuation_as_of}"
             if snapshot.positions and snapshot.valuation_as_of
@@ -250,9 +414,9 @@ class DashboardApp(App[None]):
         )
         for widget_id, title, value in (
             ("value", "Holdings value", snapshot.holdings_value),
-            ("cash", "Cash", snapshot.cash),
-            ("today", "Today's P/L", snapshot.today_pnl),
-            ("total", "Unrealized P/L", snapshot.unrealized_pnl),
+            ("cash", "Cash reserve", snapshot.cash),
+            ("today", snapshot.today_pnl_label, snapshot.today_pnl),
+            ("total", "Est. unrealized P/L", snapshot.estimated_unrealized_pnl),
         ):
             widget = self.home_screen.query_one(f"#metric-{widget_id}", Static)
             widget.border_title = title
@@ -260,26 +424,45 @@ class DashboardApp(App[None]):
             usd = (
                 snapshot.holdings_value_usd
                 if widget_id == "value"
-                else snapshot.unrealized_pnl_usd
+                else snapshot.estimated_unrealized_pnl_usd
                 if widget_id == "total"
                 else None
             )
             if widget_id == "cash" and value is not None:
-                content += "\nConfirmed snapshot"
+                content += "\nDerived from account total / report values"
+            if widget_id == "cash" and snapshot.portfolio_value is not None:
+                content += "\nAccount total: " + money(snapshot.portfolio_value, snapshot.currency)
             if widget_id == "today" and value is not None:
-                content += "\nEstimated • reference FX"
+                partial = snapshot.today_pnl_covered < snapshot.today_pnl_total
+                label = "Partial estimate" if partial else "Estimated"
+                coverage = (
+                    f" • {snapshot.today_pnl_covered}/{snapshot.today_pnl_total} holdings"
+                    if snapshot.today_pnl_total
+                    else ""
+                )
+                content += f"\n{label}{coverage} • reference FX"
             if usd is not None:
                 content += f"\n{money(usd, 'USD')}"
+            if widget_id == "total" and value is not None:
+                label = (
+                    "Partial estimate"
+                    if snapshot.estimated_pnl_covered < snapshot.estimated_pnl_total
+                    else "Estimated"
+                )
+                content += (
+                    f"\n{label} • {snapshot.estimated_pnl_covered}/"
+                    f"{snapshot.estimated_pnl_total} holdings • reference FX"
+                )
             if value is None and snapshot.positions:
                 reason = {
-                    "cash": "Confirmed balance needed",
+                    "cash": "Account total / report values needed",
                     "today": "Quotes / FX incomplete",
-                    "total": "Report P/L unavailable",
+                    "total": "Quotes / FX / report basis incomplete",
                     "value": "Valuation unavailable",
                 }[widget_id]
                 content += f"\n{reason}"
             style = "bold"
-            if widget_id == "today" and value is not None:
+            if widget_id in {"today", "total"} and value is not None:
                 style += " green" if value >= 0 else " red"
             widget.update(Text(content, style=style))
         self.home_screen.query_one("#fx-status", Static).update(
@@ -293,35 +476,187 @@ class DashboardApp(App[None]):
             else ""
         )
         self.home_screen.query_one("#allocation", Static).update(
-            "\n".join(f"{row.label:<16} {row.weight_percent:.1f}%" for row in snapshot.allocation)
-            or "Allocation is unavailable until portfolio valuations are connected."
+            (
+                "\n".join(
+                    f"{row.label:<16} {row.weight_percent:.1f}%" for row in snapshot.allocation
+                )
+                + "\n\n"
+                + snapshot.allocation_status
+            )
+            if snapshot.allocation
+            else snapshot.allocation_status
         )
         self.home_screen.query_one("#ai-status", Static).update(
+            f"Holdings analyzed  {snapshot.analyzed_positions}/{len(snapshot.positions)}\n"
+            f"Saved opportunities {snapshot.saved_opportunity_count}\n"
             f"Market sentiment   {snapshot.market_sentiment}\n"
             f"Portfolio risk     {snapshot.portfolio_risk}\n"
             f"Last analysis      {snapshot.last_analysis}\n"
             f"Next scan          {snapshot.next_scan}"
         )
+        if snapshot.risk_summary:
+            risk = snapshot.risk_summary
+            details = [f"Basis              {risk.basis}"]
+            if risk.largest_percent is not None:
+                details.append(
+                    f"Largest position   {risk.largest_symbol}: {risk.largest_percent:.1f}%"
+                )
+            if risk.top_five_percent is not None:
+                details.append(f"Top five           {risk.top_five_percent:.1f}%")
+            details.append(
+                f"Cash reserve       {risk.cash_percent:.1f}%"
+                if risk.cash_percent is not None
+                else "Cash reserve       Unknown"
+            )
+            details.append(
+                "Scope              Concentration/cash only • not overall investment risk"
+            )
+            widget = self.home_screen.query_one("#ai-status", Static)
+            widget.update(str(widget.render()) + "\n" + "\n".join(details))
         opportunities = self.home_screen.query_one("#opportunities-table", DataTable)
         opportunities.clear()
         for row in snapshot.opportunities:
             opportunities.add_row(
                 Text(row.symbol),
                 Text(row.action),
-                f"{row.confidence:.0%}" if row.confidence is not None else "—",
+                row.engine_rating or "—",
+                money(row.entry, row.entry_currency or "currency unspecified"),
+                money(row.stop_loss, row.stop_loss_currency or "currency unspecified"),
             )
         self.home_screen.query_one("#opportunities-empty", Static).update(
-            "No opportunities analyzed yet." if not snapshot.opportunities else ""
+            "No saved opportunities for unowned instruments. Press W for saved reviews."
+            if not snapshot.opportunities
+            else "Saved AI recommendations • Press W for dates and full reports."
         )
         self.home_screen.query_one("#alerts", Static).update(
             "\n".join(snapshot.alerts) or "No alerts available. Risk checks have not run."
         )
+
+    def action_columns(self) -> None:
+        if self.screen is not self.home_screen and not isinstance(self.screen, PortfolioScreen):
+            self.notify("Open the dashboard or Portfolio view to change columns.")
+            return
+        self.push_screen(
+            ColumnSelector(PORTFOLIO_COLUMNS, self.hidden_portfolio_columns), self.apply_columns
+        )
+
+    def apply_columns(self, hidden) -> None:
+        if hidden is None:
+            return
+        if self.preferences_path:
+            try:
+                self.preferences_path.parent.mkdir(parents=True, exist_ok=True)
+                temporary = self.preferences_path.with_suffix(".tmp")
+                temporary.write_text(json.dumps({"hidden_portfolio_columns": sorted(hidden)}))
+                temporary.replace(self.preferences_path)
+            except OSError:
+                self.notify(
+                    "Unable to save column preferences; previous selection retained.",
+                    severity="error",
+                )
+                return
+        self.hidden_portfolio_columns = hidden
+        if self.last_snapshot:
+            populate_portfolio(
+                self.home_screen.query_one("#portfolio-table", DataTable), self.last_snapshot
+            )
+        for screen in self.screen_stack:
+            if isinstance(screen, PortfolioScreen) and screen.last_snapshot:
+                populate_portfolio(screen.query_one(DataTable), screen.last_snapshot)
+
+    async def action_return_portfolio(self) -> None:
+        if any(getattr(screen, "running", False) for screen in self.screen_stack):
+            self.notify(
+                "Work is still running. Wait for it to finish; "
+                "batch reviews can stop after the current analysis."
+            )
+            return
+        while self.screen is not self.home_screen and not isinstance(self.screen, PortfolioScreen):
+            await self.pop_screen()
+        if not isinstance(self.screen, PortfolioScreen):
+            await self.push_screen(PortfolioScreen(self.service))
 
     def action_portfolio(self) -> None:
         if isinstance(self.screen, PortfolioScreen):
             self.screen.query_one(DataTable).focus()
             return
         self.push_screen(PortfolioScreen(self.service))
+
+    def action_typed_analysis(self):
+        if self.analysis_factory is None:
+            self.notify("AI analysis is not configured.", severity="warning")
+            return
+        try:
+            analysis, settings = self.analysis_factory()
+            self.push_screen(AnalysisModal("", analysis, settings, typed=True))
+        except Exception:
+            self.notify("Check analysis configuration and OPENAI_API_KEY.", severity="error")
+
+    def action_analyze(self) -> None:
+        if isinstance(self.screen, AnalysisModal):
+            return
+        if isinstance(self.screen, PortfolioScreen):
+            table = self.screen.query_one("#portfolio-view-table", DataTable)
+        elif self.screen is self.home_screen:
+            table = self.home_screen.query_one("#portfolio-table", DataTable)
+        else:
+            self.notify("Select a holding in the dashboard or Portfolio view first.")
+            return
+        if not table.row_count:
+            self.notify("No holding selected. Import a portfolio first.")
+            return
+        symbol = str(table.get_row_at(table.cursor_row)[0])
+        if self.analysis_factory is None:
+            self.notify("Analysis is not configured.", severity="warning")
+            return
+        try:
+            service, settings = self.analysis_factory()
+            service.request(symbol, Strategy.LONG_TERM, settings.default_horizon)
+        except AnalysisFailure as exc:
+            self.notify(str(exc), severity="error")
+            return
+        self.push_screen(AnalysisModal(symbol, service, settings))
+
+    @work()
+    async def action_full_analysis(self) -> None:
+        if isinstance(self.screen, PortfolioScreen):
+            table = self.screen.query_one("#portfolio-view-table", DataTable)
+        elif self.screen is self.home_screen:
+            table = self.home_screen.query_one("#portfolio-table", DataTable)
+        else:
+            return
+        loader = getattr(self.service, "saved_analysis", None)
+        if not table.row_count or loader is None:
+            self.notify("No saved analysis available for the selected holding.")
+            return
+        symbol = str(table.get_row_at(table.cursor_row)[0])
+        try:
+            saved = await loader(symbol)
+        except Exception:
+            self.notify("Saved analysis unavailable for this holding.", severity="warning")
+            return
+        if saved is None:
+            self.notify("No saved analysis yet. Press A to analyze this holding.")
+            return
+        self.push_screen(FullAnalysisView(saved.recommendation))
+
+    def action_daily_dashboard(self) -> None:
+        if isinstance(self.screen, DailyDashboard):
+            self.pop_screen()
+        else:
+            self.push_screen(DailyDashboard(self.service))
+
+    def action_review(self) -> None:
+        if self.analysis_factory is None:
+            self.notify("Portfolio review is not configured.", severity="warning")
+            return
+        try:
+            analysis, settings = self.analysis_factory()
+            modal = ReviewModal(analysis, settings)
+        except AnalysisFailure as exc:
+            self.notify(str(exc), severity="error")
+            return
+        self.push_screen(modal)
 
     def action_unavailable(self, feature: str) -> None:
         self.notify(f"{feature} is not implemented yet.", title="Coming later")

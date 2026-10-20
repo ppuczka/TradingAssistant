@@ -3,13 +3,16 @@
 from collections import defaultdict
 from datetime import UTC, datetime
 from decimal import Decimal
+from pathlib import Path
 
-from sqlalchemy import select
+from sqlalchemy import create_engine, func, or_, select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from trading_assistant.adapters.database import (
     Account,
     CashBalance,
+    CashDeposit,
     CashOperation,
     ImportBatch,
     Instrument,
@@ -17,8 +20,10 @@ from trading_assistant.adapters.database import (
     Transaction,
 )
 from trading_assistant.domain.portfolio import (
+    AccountAliasInput,
+    AccountValueInput,
     BrokerReport,
-    CashBalanceInput,
+    CashDepositInput,
     Holding,
     ImportResult,
     ImportValidationError,
@@ -58,19 +63,83 @@ class SqlAlchemyPortfolioRepository:
     def __init__(self, engine):
         self.engine = engine
 
-    def set_cash_balance(self, account_number: str, balance: CashBalanceInput) -> None:
+    @staticmethod
+    def _account(session, reference: str):
+        matches = session.scalars(
+            select(Account).where(
+                Account.broker == "XTB",
+                or_(
+                    Account.broker_account_id == reference,
+                    Account.alias == reference.strip().lower(),
+                ),
+            )
+        ).all()
+        if not matches:
+            raise ImportValidationError("Unknown account; import its report first.")
+        if len(matches) != 1:
+            raise ImportValidationError(
+                "Unknown or ambiguous account; use an imported account ID or alias."
+            )
+        return matches[0]
+
+    def resolve_account(self, reference: str) -> str:
+        with Session(self.engine) as session:
+            return self._account(session, reference).broker_account_id
+
+    def set_account_alias(self, reference: str, alias: AccountAliasInput) -> None:
+        try:
+            with Session(self.engine) as session, session.begin():
+                account = self._account(session, reference)
+                conflict = session.scalar(
+                    select(Account.id).where(
+                        or_(
+                            Account.alias == alias.alias,
+                            func.lower(Account.broker_account_id) == alias.alias,
+                        ),
+                        Account.id != account.id,
+                    )
+                )
+                if conflict is not None:
+                    raise ImportValidationError(
+                        "Alias is already used by another account or account ID."
+                    )
+                account.alias = alias.alias
+        except IntegrityError as exc:
+            raise ImportValidationError("Alias is already used by another account.") from exc
+
+    def set_account_value(self, account_number: str, balance: AccountValueInput) -> None:
         with Session(self.engine) as session, session.begin():
-            account = session.scalar(
-                select(Account).where(
-                    Account.broker == "XTB", Account.broker_account_id == account_number
+            account = self._account(session, account_number)
+            self._save_account_value(session, account, balance)
+
+    def add_money(self, account_number: str, deposit: CashDepositInput) -> AccountValueInput:
+        with Session(self.engine) as session, session.begin():
+            account = self._account(session, account_number)
+            previous = session.scalar(
+                select(CashBalance)
+                .where(CashBalance.account_id == account.id)
+                .order_by(CashBalance.as_of.desc(), CashBalance.id.desc())
+                .limit(1)
+            )
+            if previous is None:
+                raise ImportValidationError(
+                    "Total account value is unknown; use set-account-value first."
+                )
+            now = datetime.now(UTC)
+            balance = AccountValueInput(amount=previous.amount + deposit.amount, as_of=now)
+            self._save_account_value(session, account, balance)
+            session.add(
+                CashDeposit(
+                    account_id=account.id,
+                    amount=deposit.amount,
+                    currency=account.currency,
+                    occurred_at=stamp(now),
                 )
             )
-            if account is None:
-                raise ImportValidationError("Unknown account; import its report first.")
-            self._save_cash_balance(session, account, balance)
+            return balance
 
     @staticmethod
-    def _save_cash_balance(session, account, balance: CashBalanceInput) -> None:
+    def _save_account_value(session, account, balance: AccountValueInput) -> None:
         if account.currency != "PLN":
             raise ImportValidationError("Only PLN cash balances are supported.")
         session.add(
@@ -84,7 +153,7 @@ class SqlAlchemyPortfolioRepository:
         )
 
     def import_report(
-        self, report: BrokerReport, cash_balance: CashBalanceInput | None = None
+        self, report: BrokerReport, account_value: AccountValueInput | None = None
     ) -> ImportResult:
         with Session(self.engine) as session, session.begin():
             account = session.scalar(
@@ -94,6 +163,15 @@ class SqlAlchemyPortfolioRepository:
                 )
             )
             if account is None:
+                if (
+                    session.scalar(
+                        select(Account.id).where(Account.alias == report.account_number.lower())
+                    )
+                    is not None
+                ):
+                    raise ImportValidationError(
+                        "Report account ID conflicts with an existing alias."
+                    )
                 account = Account(
                     broker="XTB", broker_account_id=report.account_number, currency=report.currency
                 )
@@ -101,8 +179,8 @@ class SqlAlchemyPortfolioRepository:
                 session.flush()
             if account.currency != report.currency:
                 raise ImportValidationError("Account currency conflicts with existing records.")
-            if cash_balance is not None:
-                self._save_cash_balance(session, account, cash_balance)
+            if account_value is not None:
+                self._save_account_value(session, account, account_value)
             previous = session.scalar(
                 select(ImportBatch).where(
                     ImportBatch.account_id == account.id,
@@ -279,13 +357,13 @@ class SqlAlchemyPortfolioRepository:
                 if balance is None:
                     all_confirmed = False
                     state.warnings.append(
-                        f"Account {account.broker_account_id}: cash balance not confirmed."
+                        f"Account {account.broker_account_id}: total account value not confirmed."
                     )
                 else:
                     confirmed_total += balance.amount
-                    state.cash_balance_dates.append(datetime.fromisoformat(balance.as_of))
+                    state.account_value_dates.append(datetime.fromisoformat(balance.as_of))
                     state.warnings.append(
-                        f"Account {account.broker_account_id}: confirmed My Trades cash "
+                        f"Account {account.broker_account_id}: confirmed total account value "
                         f"{balance.amount:,.2f} PLN as of {balance.as_of}; "
                         "a manual snapshot, not automatically updated by imports."
                     )
@@ -307,11 +385,17 @@ class SqlAlchemyPortfolioRepository:
                         select(ReportHolding).where(ReportHolding.import_id == batch.id)
                     )
                 }
+                account_holdings_total = Decimal(0)
+                account_values_known = True
                 for instrument_id, quantity in quantities.items():
                     if abs(quantity) <= TOLERANCE:
                         continue
                     instrument = session.get(Instrument, instrument_id)
                     report = observations.get(instrument_id)
+                    if report is None:
+                        account_values_known = False
+                    else:
+                        account_holdings_total += report.market_value
                     pnl = None
                     if report and report.lots and all(lot.get("Net Profit") for lot in report.lots):
                         values = [Decimal(lot["Net Profit"]) for lot in report.lots]
@@ -341,6 +425,17 @@ class SqlAlchemyPortfolioRepository:
                             if existing.report_pnl_amount is not None and pnl is not None
                             else None
                         )
+                if (
+                    balance is not None
+                    and account_values_known
+                    and balance.amount < account_holdings_total
+                ):
+                    state.account_value_mismatches.append(account.broker_account_id)
+                    state.warnings.append(
+                        f"Account {account.broker_account_id}: "
+                        "total account value below report holdings; "
+                        "reserve cannot be calculated. Check snapshot dates and balance."
+                    )
                 for cash in session.scalars(
                     select(CashOperation).where(
                         CashOperation.account_id == account.id,
@@ -348,7 +443,28 @@ class SqlAlchemyPortfolioRepository:
                     )
                 ):
                     state.cash_movement += cash.amount
-            state.cash_balance = confirmed_total if all_confirmed else None
+            state.account_value = confirmed_total if all_confirmed else None
             state.holdings = sorted(holdings.values(), key=lambda h: h.symbol)
             state.warnings = sorted(set(state.warnings))
             return state
+
+
+def resolve_import_account(path: Path, reference: str) -> str:
+    """Resolve known aliases without creating a database or migrating during dry runs."""
+    if not path.exists():
+        return reference
+    engine = create_engine(f"sqlite:///{path.resolve()}")
+    try:
+        with engine.connect() as connection:
+            columns = connection.execute(text("PRAGMA table_info(accounts)")).all()
+            if not any(column[1] == "alias" for column in columns):
+                return reference
+            resolved = connection.execute(
+                text(
+                    "SELECT broker_account_id FROM accounts WHERE broker = 'XTB' AND alias = :alias"
+                ),
+                {"alias": reference.strip().lower()},
+            ).scalar()
+            return resolved if resolved is not None else reference
+    finally:
+        engine.dispose()

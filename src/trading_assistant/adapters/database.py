@@ -49,6 +49,8 @@ class Account(Base):
     broker_account_id: Mapped[str] = mapped_column(String(128))
     currency: Mapped[str] = mapped_column(String(3))
 
+    alias: Mapped[str | None] = mapped_column(String(64), unique=True, index=True)
+
 
 class Instrument(Base):
     __tablename__ = "instruments"
@@ -122,7 +124,38 @@ class ReportHolding(Base):
     lots: Mapped[list] = mapped_column(JSON)
 
 
+class IntradayEstimate(Base):
+    __tablename__ = "intraday_estimates"
+    __table_args__ = (UniqueConstraint("minute", "segment"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    minute: Mapped[str] = mapped_column(String(40), index=True)
+    observed_at: Mapped[str] = mapped_column(String(40))
+    segment: Mapped[str] = mapped_column(String(40))
+    context: Mapped[str] = mapped_column(String(64))
+    covered: Mapped[int]
+    total: Mapped[int]
+    pnl: Mapped[dict] = mapped_column(JSON)
+    percent: Mapped[dict | None] = mapped_column(JSON)
+
+
+class DailyEstimate(Base):
+    __tablename__ = "daily_estimates"
+    day: Mapped[str] = mapped_column(String(10), primary_key=True)
+    payload: Mapped[dict] = mapped_column(JSON)
+
+
+class CashDeposit(Base):
+    __tablename__ = "cash_deposits"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id"), index=True)
+    amount: Mapped[Decimal] = mapped_column(ExactDecimal())
+    currency: Mapped[str] = mapped_column(String(3))
+    occurred_at: Mapped[str] = mapped_column(String(40))
+
+
 class CashBalance(Base):
+    """Legacy table name: owner-confirmed total account values, including holdings."""
+
     __tablename__ = "cash_balances"
     id: Mapped[int] = mapped_column(primary_key=True)
     account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id"), index=True)

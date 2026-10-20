@@ -501,34 +501,35 @@ def test_new_report_checks_affected_snapshots_before_its_own_date(repository, re
 
 
 async def test_cash_confirmation_import_update_and_dashboard(repository, report_path):
-    from trading_assistant.domain.portfolio import CashBalanceInput
+    from trading_assistant.domain.portfolio import AccountValueInput
 
     report = XtbReportReader().read(report_path)
-    first = CashBalanceInput(amount="123.456789", as_of="2026-10-01T14:00:00+02:00")
+    first = AccountValueInput(amount="123.456789", as_of="2026-10-01T14:00:00+02:00")
     repository.import_report(report, first)
     state = repository.portfolio()
-    assert state.cash_balance == Decimal("123.456789")
-    assert state.cash_balance_dates == [datetime(2026, 10, 1, 12, tzinfo=UTC)]
+    assert state.account_value == Decimal("123.456789")
+    assert state.account_value_dates == [datetime(2026, 10, 1, 12, tzinfo=UTC)]
     snapshot = await PortfolioDashboardService(repository).snapshot()
-    assert snapshot.cash == Decimal("123.456789")
+    assert snapshot.cash is None
+    assert any("below report holdings" in alert for alert in snapshot.alerts)
     assert any("manual snapshot" in alert for alert in snapshot.alerts)
-    assert snapshot.portfolio_value is None
-    second = CashBalanceInput(amount="0", as_of="2026-10-02T12:00:00Z")
-    repository.set_cash_balance(report.account_number, second)
-    repository.set_cash_balance(report.account_number, first)
-    assert repository.portfolio().cash_balance == 0
+    assert snapshot.portfolio_value == Decimal("123.456789")
+    second = AccountValueInput(amount="0", as_of="2026-10-02T12:00:00Z")
+    repository.set_account_value(report.account_number, second)
+    repository.set_account_value(report.account_number, first)
+    assert repository.portfolio().account_value == 0
     # Reimporting does not erase or automatically adjust a confirmation.
     repository.import_report(report)
-    assert repository.portfolio().cash_balance == 0
+    assert repository.portfolio().account_value == 0
 
 
 def test_cash_confirmation_atomic_rollback_and_unknown_account(repository, report_path):
     from trading_assistant.adapters.database import CashBalance
-    from trading_assistant.domain.portfolio import CashBalanceInput
+    from trading_assistant.domain.portfolio import AccountValueInput
 
-    balance = CashBalanceInput(amount="100", as_of="2026-10-01T12:00:00Z")
+    balance = AccountValueInput(amount="100", as_of="2026-10-01T12:00:00Z")
     with pytest.raises(ImportValidationError, match="Unknown account"):
-        repository.set_cash_balance("missing", balance)
+        repository.set_account_value("missing", balance)
     report = XtbReportReader().read(report_path)
     report.cash_events = [event for event in report.cash_events if event.operation_id != "b2"]
     with pytest.raises(ImportValidationError):
@@ -538,15 +539,15 @@ def test_cash_confirmation_atomic_rollback_and_unknown_account(repository, repor
 
 
 def test_cash_total_requires_every_account(repository, report_path):
-    from trading_assistant.domain.portfolio import CashBalanceInput
+    from trading_assistant.domain.portfolio import AccountValueInput
 
     report = XtbReportReader().read(report_path)
-    balance = CashBalanceInput(amount="100", as_of="2026-10-01T12:00:00Z")
+    balance = AccountValueInput(amount="100", as_of="2026-10-01T12:00:00Z")
     repository.import_report(report, balance)
     repository.import_report(report.model_copy(update={"account_number": "second"}))
-    assert repository.portfolio().cash_balance is None
-    repository.set_cash_balance("second", balance)
-    assert repository.portfolio().cash_balance == 200
+    assert repository.portfolio().account_value is None
+    repository.set_account_value("second", balance)
+    assert repository.portfolio().account_value == 200
 
 
 def test_cash_cli_import_dry_run_and_later_update(report_path, tmp_path):
@@ -568,11 +569,11 @@ def test_cash_cli_import_dry_run_and_later_update(report_path, tmp_path):
     ]
     preview = runner.invoke(app, base + args + ["--dry-run"])
     assert preview.exit_code == 0, preview.output
-    assert "Cash preview" in preview.output
+    assert "Account value preview" in preview.output
     assert not database.exists()
     imported = runner.invoke(app, base + args)
     assert imported.exit_code == 0, imported.output
-    assert open_repository(database).portfolio().cash_balance == Decimal("321.09")
+    assert open_repository(database).portfolio().account_value == Decimal("321.09")
     updated = runner.invoke(
         app,
         base
@@ -586,7 +587,7 @@ def test_cash_cli_import_dry_run_and_later_update(report_path, tmp_path):
         ],
     )
     assert updated.exit_code == 0, updated.output
-    assert open_repository(database).portfolio().cash_balance == Decimal("250.12")
+    assert open_repository(database).portfolio().account_value == Decimal("250.12")
 
 
 @pytest.mark.parametrize("currency", [None, "PLN"])
@@ -648,3 +649,134 @@ def test_blank_summary_currency_defaults_to_pln(report_path):
     workbook["Open Positions"]["D4"] = None
     workbook.save(report_path)
     assert XtbReportReader().read(report_path).currency == "PLN"
+
+
+def test_add_money_records_deposit_and_updates_only_selected_account(repository, report_path):
+    from trading_assistant.adapters.database import CashBalance, CashDeposit
+    from trading_assistant.domain.portfolio import AccountValueInput, CashDepositInput
+
+    report = XtbReportReader().read(report_path)
+    repository.import_report(report, AccountValueInput(amount="100", as_of="2026-10-01T12:00:00Z"))
+    repository.import_report(
+        report.model_copy(update={"account_number": "second"}),
+        AccountValueInput(amount="50", as_of="2026-10-01T12:00:00Z"),
+    )
+    updated = repository.add_money(report.account_number, CashDepositInput(amount="12.3456789"))
+    assert updated.amount == Decimal("112.3456789")
+    assert repository.portfolio().account_value == Decimal("162.3456789")
+    assert count(repository, CashDeposit) == 1
+    assert count(repository, CashBalance) == 3
+    repository.import_report(report)
+    assert repository.portfolio().account_value == Decimal("162.3456789")
+    repository.set_account_value(
+        report.account_number, AccountValueInput(amount="80", as_of=datetime.now(UTC))
+    )
+    assert repository.portfolio().account_value == Decimal("130")
+    assert count(repository, CashDeposit) == 1
+
+
+def test_add_money_unknown_balance_and_account_are_atomic(repository, report_path):
+    from trading_assistant.adapters.database import CashBalance, CashDeposit
+    from trading_assistant.domain.portfolio import CashDepositInput
+
+    repository.import_report(XtbReportReader().read(report_path))
+    for account in ["missing", "synthetic-account"]:
+        with pytest.raises(ImportValidationError):
+            repository.add_money(account, CashDepositInput(amount="10"))
+    assert count(repository, CashDeposit) == 0
+    assert count(repository, CashBalance) == 0
+
+
+def test_add_money_cli(report_path, tmp_path):
+    from typer.testing import CliRunner
+
+    from trading_assistant.bootstrap import repository as open_repository
+    from trading_assistant.cli import app
+
+    database = tmp_path / "deposits.sqlite3"
+    runner = CliRunner()
+    base = ["--database", str(database)]
+    assert (
+        runner.invoke(
+            app, base + ["import-xtb", str(report_path), "--cash-balance", "100"]
+        ).exit_code
+        == 0
+    )
+    result = runner.invoke(app, base + ["add-money", "25.50", "--account", "synthetic-account"])
+    assert result.exit_code == 0, result.output
+    assert "125.50 PLN" in result.output
+    assert open_repository(database).portfolio().account_value == Decimal("125.50")
+    for amount in ["0", "-1", "NaN", "Infinity", "bad"]:
+        assert (
+            runner.invoke(
+                app, base + ["add-money", amount, "--account", "synthetic-account"]
+            ).exit_code
+            != 0
+        )
+    assert open_repository(database).portfolio().account_value == Decimal("125.50")
+
+
+def test_account_alias_resolution_uniqueness_and_rename(repository, report_path):
+    from trading_assistant.domain.portfolio import (
+        AccountAliasInput,
+        AccountValueInput,
+        CashDepositInput,
+    )
+
+    report = XtbReportReader().read(report_path)
+    repository.import_report(report)
+    repository.import_report(report.model_copy(update={"account_number": "second"}))
+    repository.set_account_alias(report.account_number, AccountAliasInput(alias=" IKZE "))
+    assert repository.resolve_account("IKZE") == report.account_number
+    repository.set_account_value("ikze", AccountValueInput(amount="100", as_of=datetime.now(UTC)))
+    assert repository.add_money("IKZE", CashDepositInput(amount="10")).amount == 110
+    for alias in ["IKZE", report.account_number]:
+        with pytest.raises(ImportValidationError):
+            repository.set_account_alias("second", AccountAliasInput(alias=alias))
+    repository.set_account_alias("IKZE", AccountAliasInput(alias="retirement"))
+    with pytest.raises(ImportValidationError):
+        repository.resolve_account("ikze")
+    assert repository.resolve_account("retirement") == report.account_number
+    assert repository.resolve_account(report.account_number) == report.account_number
+    with pytest.raises(ImportValidationError):
+        repository.import_report(report.model_copy(update={"account_number": "RETIREMENT"}))
+
+
+def test_account_alias_cli_and_import_dry_run(report_path, tmp_path):
+    import sqlite3
+    from contextlib import closing
+
+    from typer.testing import CliRunner
+
+    from trading_assistant.bootstrap import repository as open_repository
+    from trading_assistant.cli import app
+
+    database = tmp_path / "aliases.sqlite3"
+    base = ["--database", str(database)]
+    runner = CliRunner()
+    assert runner.invoke(app, base + ["import-xtb", str(report_path)]).exit_code == 0
+    result = runner.invoke(
+        app, base + ["set-account-alias", "IKZE", "--account", "synthetic-account"]
+    )
+    assert result.exit_code == 0, result.output
+    assert runner.invoke(app, base + ["set-cash", "100", "--account", "ikze"]).exit_code == 0
+    assert runner.invoke(app, base + ["add-money", "25", "--account", "IKZE"]).exit_code == 0
+    assert open_repository(database).portfolio().account_value == 125
+    # WAL checkpointing may change file headers without changing persisted data.
+    def stored_content():
+        with closing(sqlite3.connect(database)) as connection:
+            return tuple(connection.iterdump())
+
+    before = stored_content()
+    preview = runner.invoke(
+        app, base + ["import-xtb", str(report_path), "--account", "ikze", "--dry-run"]
+    )
+    assert preview.exit_code == 0, preview.output
+    assert stored_content() == before
+    result = runner.invoke(app, base + ["import-xtb", str(report_path), "--account", "IKZE"])
+    assert result.exit_code == 0, result.output
+    for alias in ["", "123", "has spaces", "a" * 65, "bad!"]:
+        assert (
+            runner.invoke(app, base + ["set-account-alias", alias, "--account", "ikze"]).exit_code
+            != 0
+        )

@@ -73,8 +73,9 @@ class PortfolioState(BaseModel):
     holdings: list[Holding] = Field(default_factory=list)
     report_dates: list[datetime] = Field(default_factory=list)
     cash_movement: Decimal = Decimal("0")
-    cash_balance: Decimal | None = None
-    cash_balance_dates: list[datetime] = Field(default_factory=list)
+    account_value: Decimal | None = None
+    account_value_dates: list[datetime] = Field(default_factory=list)
+    account_value_mismatches: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
 
 
@@ -82,8 +83,8 @@ class ImportValidationError(ValueError):
     """Invalid report, conflict, or failed ledger reconciliation."""
 
 
-class CashBalanceInput(BaseModel):
-    """A human-confirmed My Trades cash observation, not a ledger event."""
+class AccountValueInput(BaseModel):
+    """A human-confirmed total account value including holdings, in PLN."""
 
     amount: Decimal = Field(ge=0, allow_inf_nan=False)
     as_of: AwareDatetime
@@ -93,5 +94,24 @@ class CashBalanceInput(BaseModel):
     def validate_time(cls, value: datetime) -> datetime:
         value = value.astimezone(UTC)
         if value > datetime.now(UTC):
-            raise ValueError("Cash balance timestamp cannot be in the future.")
+            raise ValueError("Account value timestamp cannot be in the future.")
         return value
+
+
+class CashDepositInput(BaseModel):
+    """Money already deposited into the broker account, in PLN."""
+
+    amount: Decimal = Field(gt=0, allow_inf_nan=False)
+
+
+class AccountAliasInput(BaseModel):
+    alias: str = Field(pattern=r"^[a-z][a-z0-9_-]{0,63}$")
+
+    @field_validator("alias", mode="before")
+    @classmethod
+    def normalize_alias(cls, value: str) -> str:
+        return value.strip().lower()
+
+
+# Compatibility for integrations using the previous input type name.
+CashBalanceInput = AccountValueInput

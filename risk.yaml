@@ -1,0 +1,4 @@
+# Informational report-based warnings; these do not authorize or block orders.
+max_position_percent: 20
+max_top_five_percent: 60
+min_cash_percent: 10
